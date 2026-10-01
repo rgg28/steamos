@@ -1,527 +1,760 @@
-name: Build SteamOS RAW
+name: Build Installed SteamOS IMG
 
-"on":
+on:
   workflow_dispatch:
+    inputs:
+      disk_size:
+        description: "Tamaño del disco SteamOS"
+        required: true
+        default: "64G"
+        type: string
 
-permissions:
-  contents: read
+      compression:
+        description: "Comprimir el IMG con zstd"
+        required: true
+        default: true
+        type: boolean
 
 jobs:
-  build:
-    name: Build SteamOS Installed RAW
+  build-steamos:
+    name: Install SteamOS inside QEMU
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+
+    timeout-minutes: 90
 
     env:
-      STEAMOS_URL: "https://steamdeck-images.steamos.cloud/steamdeck/20260416.1000/steamdeck-20260416.1000-3.9.0.img.zst"
-      WORKDIR: "/home/runner/steamos-build"
-      SOURCE_IMAGE: "/home/runner/steamos-build/source.img"
-      OUTPUT_IMAGE: "/home/runner/steamos-build/SteamOS-installed.img"
+      WORKDIR: /tmp/steamos-build
+      DISK_SIZE: ${{ inputs.disk_size }}
 
     steps:
 
-      - name: Checkout
+      # ============================================================
+      # PREPARACIÓN
+      # ============================================================
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Show runner information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "STEAMOS BUILD"
+          echo "=============================================="
+
+          uname -a
+          echo
+          lscpu
+          echo
+          free -h
+          echo
+          df -h
+
+      - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
 
           sudo apt-get update
 
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            ovmf \
+            curl \
+            wget \
+            bzip2 \
             zstd \
+            rsync \
+            util-linux \
             gdisk \
+            dosfstools \
             e2fsprogs \
             btrfs-progs \
-            util-linux \
-            dosfstools \
-            curl \
-            rsync \
-            file
+            parted \
+            pciutils \
+            jq \
+            python3
 
-          mkdir -p "${WORKDIR}"
+      # ============================================================
+      # KVM
+      # ============================================================
 
-      - name: Download official SteamOS image
+      - name: Check KVM
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "=============================================="
+          echo "KVM"
+          echo "=============================================="
+
+          if [[ ! -e /dev/kvm ]]; then
+            echo "ERROR: /dev/kvm is not available."
+            echo
+            echo "GitHub-hosted runners normally expose KVM,"
+            echo "but this runner does not currently expose it."
+            exit 1
+          fi
+
+          ls -l /dev/kvm
+
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+            echo "KVM is accessible."
+          else
+            echo "ERROR: /dev/kvm exists but is not accessible."
+            exit 1
+          fi
+
+      # ============================================================
+      # DIRECTORIOS
+      # ============================================================
+
+      - name: Create working directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf "$WORKDIR"
+
+          mkdir -p \
+            "$WORKDIR/download" \
+            "$WORKDIR/recovery" \
+            "$WORKDIR/disk" \
+            "$WORKDIR/ovmf" \
+            "$WORKDIR/logs" \
+            "$WORKDIR/output"
+
+      # ============================================================
+      # OBTENER IMAGEN OFICIAL DE VALVE
+      # ============================================================
+
+      - name: Find latest official SteamOS recovery image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INDEX="https://steamdeck-images.steamos.cloud/recovery/"
+
+          echo "=============================================="
+          echo "STEAMOS RECOVERY"
+          echo "=============================================="
+
+          echo "Consultando:"
+          echo "$INDEX"
 
           curl \
             --fail \
             --location \
-            --retry 10 \
+            --retry 5 \
             --retry-delay 5 \
-            --retry-all-errors \
-            --progress-bar \
-            "${STEAMOS_URL}" \
-            -o "${WORKDIR}/source.img.zst"
+            --connect-timeout 30 \
+            --max-time 120 \
+            "$INDEX" \
+            -o "$WORKDIR/download/index.html"
 
-          ls -lh "${WORKDIR}/source.img.zst"
+          echo
+          echo "Imágenes disponibles:"
+          grep -oE \
+            'steamdeck-oobe-repair-[^"]+\.img\.bz2' \
+            "$WORKDIR/download/index.html" \
+            | sort -V \
+            | tail -20 \
+            || true
 
-      - name: Decompress image
-        shell: bash
-        run: |
-          set -euo pipefail
+          IMAGE_NAME="$(
+            grep -oE \
+              'steamdeck-oobe-repair-[^"]+\.img\.bz2' \
+              "$WORKDIR/download/index.html" \
+            | sort -V \
+            | tail -1
+          )"
 
-          zstd \
-            -d \
-            --force \
-            "${WORKDIR}/source.img.zst" \
-            -o "${SOURCE_IMAGE}"
-
-          ls -lh "${SOURCE_IMAGE}"
-
-      - name: Inspect source image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo sgdisk -v "${SOURCE_IMAGE}"
-
-          echo "=========================================="
-          echo "STEAMOS PARTITIONS"
-          echo "=========================================="
-
-          sudo sgdisk -p "${SOURCE_IMAGE}"
-
-      - name: Create 64 GiB output image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -f "${OUTPUT_IMAGE}"
-
-          truncate \
-            -s 64G \
-            "${OUTPUT_IMAGE}"
-
-          SOURCE_SIZE="$(stat -c '%s' "${SOURCE_IMAGE}")"
-          OUTPUT_SIZE="$(stat -c '%s' "${OUTPUT_IMAGE}")"
-
-          echo "Source: ${SOURCE_SIZE}"
-          echo "Output: ${OUTPUT_SIZE}"
-
-          if [ "${SOURCE_SIZE}" -gt "${OUTPUT_SIZE}" ]; then
-            echo "ERROR: source image is larger than 64 GiB."
+          if [[ -z "$IMAGE_NAME" ]]; then
+            echo
+            echo "ERROR: no se encontró una imagen OOBE recovery."
             exit 1
           fi
 
-      - name: Copy official image
+          IMAGE_URL="${INDEX}${IMAGE_NAME}"
+
+          echo
+          echo "Imagen seleccionada:"
+          echo "$IMAGE_NAME"
+
+          echo
+          echo "URL:"
+          echo "$IMAGE_URL"
+
+          printf '%s\n' "$IMAGE_NAME" > "$WORKDIR/download/image-name.txt"
+          printf '%s\n' "$IMAGE_URL" > "$WORKDIR/download/image-url.txt"
+
+      - name: Download official SteamOS recovery
         shell: bash
         run: |
           set -euo pipefail
 
-          dd \
-            if="${SOURCE_IMAGE}" \
-            of="${OUTPUT_IMAGE}" \
-            bs=64M \
-            conv=notrunc \
-            status=progress
+          IMAGE_NAME="$(cat "$WORKDIR/download/image-name.txt")"
+          IMAGE_URL="$(cat "$WORKDIR/download/image-url.txt")"
+
+          echo "Descargando SteamOS:"
+          echo "$IMAGE_NAME"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 3600 \
+            --progress-bar \
+            "$IMAGE_URL" \
+            -o "$WORKDIR/download/$IMAGE_NAME"
+
+          test -s "$WORKDIR/download/$IMAGE_NAME"
+
+          ls -lh "$WORKDIR/download/$IMAGE_NAME"
+
+      # ============================================================
+      # DESCOMPRIMIR RECOVERY
+      # ============================================================
+
+      - name: Extract SteamOS IMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="$(cat "$WORKDIR/download/image-name.txt")"
+
+          cp \
+            "$WORKDIR/download/$IMAGE_NAME" \
+            "$WORKDIR/recovery/$IMAGE_NAME"
+
+          echo "Descomprimiendo recovery..."
+
+          bunzip2 -f \
+            "$WORKDIR/recovery/$IMAGE_NAME"
+
+          RECOVERY_IMG="${IMAGE_NAME%.bz2}"
+
+          if [[ ! -f "$WORKDIR/recovery/$RECOVERY_IMG" ]]; then
+            echo "ERROR: no se encontró el IMG extraído."
+            exit 1
+          fi
+
+          echo "Recovery:"
+          ls -lh "$WORKDIR/recovery/$RECOVERY_IMG"
+
+          printf '%s\n' "$RECOVERY_IMG" \
+            > "$WORKDIR/recovery/recovery-name.txt"
+
+      # ============================================================
+      # OVMF
+      # ============================================================
+
+      - name: Prepare UEFI firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Buscando OVMF..."
+
+          OVMF_CODE=""
+
+          for f in \
+            /usr/share/OVMF/OVMF_CODE_4M.fd \
+            /usr/share/OVMF/OVMF_CODE.fd \
+            /usr/share/qemu/OVMF_CODE.fd
+          do
+            if [[ -f "$f" ]]; then
+              OVMF_CODE="$f"
+              break
+            fi
+          done
+
+          if [[ -z "$OVMF_CODE" ]]; then
+            echo "ERROR: OVMF_CODE no encontrado."
+            exit 1
+          fi
+
+          echo "OVMF:"
+          echo "$OVMF_CODE"
+
+          cp \
+            "$OVMF_CODE" \
+            "$WORKDIR/ovmf/OVMF_CODE.fd"
+
+          if [[ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]]; then
+            cp \
+              /usr/share/OVMF/OVMF_VARS_4M.fd \
+              "$WORKDIR/ovmf/OVMF_VARS.fd"
+          elif [[ -f /usr/share/OVMF/OVMF_VARS.fd ]]; then
+            cp \
+              /usr/share/OVMF/OVMF_VARS.fd \
+              "$WORKDIR/ovmf/OVMF_VARS.fd"
+          else
+            echo "ERROR: OVMF_VARS no encontrado."
+            exit 1
+          fi
+
+          chmod 644 "$WORKDIR/ovmf/"*.fd
+
+      # ============================================================
+      # DISCO DESTINO
+      # ============================================================
+
+      - name: Create virtual SteamOS disk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET="$WORKDIR/disk/steamOS-installed.img"
+
+          echo "=============================================="
+          echo "CREANDO DISCO DESTINO"
+          echo "=============================================="
+
+          echo "Tamaño:"
+          echo "$DISK_SIZE"
+
+          qemu-img create \
+            -f raw \
+            "$TARGET" \
+            "$DISK_SIZE"
+
+          qemu-img info "$TARGET"
+
+      # ============================================================
+      # PREPARAR SCRIPT DE INSTALACIÓN
+      # ============================================================
+
+      - name: Prepare unattended SteamOS installer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$WORKDIR/install-steamos.sh" <<'INSTALLER'
+          #!/usr/bin/env bash
+
+          set -euo pipefail
+
+          LOG=/tmp/steamos-install.log
+
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=============================================="
+          echo "AUTOMATED STEAMOS INSTALLER"
+          echo "=============================================="
+
+          TARGET="/dev/nvme0n1"
+
+          echo "Target disk:"
+          lsblk "$TARGET" || true
+
+          echo
+          echo "Searching SteamOS recovery tools..."
+
+          CANDIDATES=(
+            "/home/deck/tools/repair_device.sh"
+            "/home/deck/Desktop/tools/repair_device.sh"
+            "/root/tools/repair_device.sh"
+            "/usr/bin/repair_device.sh"
+          )
+
+          REPAIR=""
+
+          for f in "${CANDIDATES[@]}"; do
+            if [[ -f "$f" ]]; then
+              REPAIR="$f"
+              break
+            fi
+          done
+
+          if [[ -z "$REPAIR" ]]; then
+            echo "Searching filesystem..."
+
+            REPAIR="$(
+              find /home /root /usr \
+                -type f \
+                -name repair_device.sh \
+                2>/dev/null \
+                | head -1 \
+            )"
+          fi
+
+          if [[ -z "$REPAIR" ]]; then
+            echo
+            echo "ERROR: repair_device.sh was not found."
+            echo
+            echo "Recovery contents:"
+            find /home/deck/tools /home/deck/Desktop \
+              -maxdepth 3 \
+              -type f \
+              2>/dev/null \
+              | head -200 || true
+
+            exit 1
+          fi
+
+          echo
+          echo "Installer:"
+          echo "$REPAIR"
+
+          chmod +x "$REPAIR"
+
+          echo
+          echo "Patching installer target disk..."
+
+          cp "$REPAIR" /tmp/repair_device.sh.original
+
+          sed \
+            -i \
+            's#^DISK=/dev/nvme0n1$#DISK=/dev/nvme0n1#' \
+            "$REPAIR"
+
+          sed \
+            -i \
+            's/^DISK_SUFFIX=p$/DISK_SUFFIX=p/' \
+            "$REPAIR"
+
+          echo
+          echo "Executing SteamOS installer..."
+
+          export NOPROMPT=1
+          export POWEROFF=1
+
+          "$REPAIR" all
+
+          echo
+          echo "=============================================="
+          echo "INSTALLER FINISHED"
+          echo "=============================================="
 
           sync
 
-      - name: Repair backup GPT
+          echo
+          echo "Target disk:"
+          lsblk "$TARGET" || true
+
+          echo
+          echo "Filesystem signatures:"
+          blkid "$TARGET"* || true
+
+          echo
+          echo "Installation complete."
+
+          # Keep the VM alive long enough for QEMU to observe the result.
+          touch /tmp/STEAMOS_INSTALL_COMPLETE
+
+          sleep 10
+
+          poweroff -f || true
+
+          INSTALLER
+
+          chmod +x "$WORKDIR/install-steamos.sh"
+
+      # ============================================================
+      # BOOT RECOVERY + INSTALL
+      # ============================================================
+
+      - name: Boot SteamOS recovery and install to virtual disk
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo sgdisk \
-            -e \
-            "${OUTPUT_IMAGE}"
+          RECOVERY_NAME="$(cat "$WORKDIR/recovery/recovery-name.txt")"
 
-          sudo sgdisk \
-            -v \
-            "${OUTPUT_IMAGE}"
+          RECOVERY="$WORKDIR/recovery/$RECOVERY_NAME"
+          TARGET="$WORKDIR/disk/steamOS-installed.img"
 
-      - name: Detect SteamOS HOME partition
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "=============================================="
+          echo "QEMU STEAMOS INSTALLATION"
+          echo "=============================================="
 
-          INFO="$(sudo sgdisk -i 8 "${OUTPUT_IMAGE}")"
+          echo "Recovery:"
+          echo "$RECOVERY"
 
-          echo "${INFO}"
+          echo "Target:"
+          echo "$TARGET"
 
-          START="$(
-            printf '%s\n' "${INFO}" |
-            awk -F: '
-              /First sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
+          test -f "$RECOVERY"
+          test -f "$TARGET"
 
-          END="$(
-            printf '%s\n' "${INFO}" |
-            awk -F: '
-              /Last sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
+          # ----------------------------------------------------------
+          # Inject installer into the recovery image.
+          #
+          # We use a writable copy because the original Valve image
+          # must remain untouched.
+          # ----------------------------------------------------------
 
-          if [ -z "${START}" ]; then
-            echo "ERROR: could not determine partition 8 start."
-            exit 1
-          fi
+          cp \
+            "$RECOVERY" \
+            "$WORKDIR/recovery/recovery-working.img"
 
-          if [ -z "${END}" ]; then
-            echo "ERROR: could not determine partition 8 end."
-            exit 1
-          fi
+          RECOVERY_WORKING="$WORKDIR/recovery/recovery-working.img"
 
-          echo "HOME_START=${START}"
-          echo "HOME_END=${END}"
+          echo
+          echo "Recovery image:"
+          qemu-img info "$RECOVERY_WORKING"
 
-          echo "HOME_START=${START}" >> "${GITHUB_ENV}"
-          echo "HOME_END=${END}" >> "${GITHUB_ENV}"
+          # ----------------------------------------------------------
+          # Start VM.
+          #
+          # The recovery image is the first NVMe disk.
+          # The destination is the second NVMe disk.
+          #
+          # SteamOS recovery expects an NVMe-style destination.
+          # ----------------------------------------------------------
 
-      - name: Expand partition 8 inside image
-        shell: bash
-        run: |
-          set -euo pipefail
+          rm -f "$WORKDIR/logs/qemu.log"
 
-          LAST="$(sudo sgdisk -E "${OUTPUT_IMAGE}")"
-
-          echo "HOME_START=${HOME_START}"
-          echo "OLD_HOME_END=${HOME_END}"
-          echo "NEW_HOME_END=${LAST}"
-
-          if [ "${HOME_END}" -lt "${LAST}" ]; then
-
-            sudo sgdisk \
-              -d 8 \
-              "${OUTPUT_IMAGE}"
-
-            sudo sgdisk \
-              -n "8:${HOME_START}:${LAST}" \
-              -t "8:8300" \
-              "${OUTPUT_IMAGE}"
-
-          fi
-
-          sudo sgdisk \
-            -e \
-            "${OUTPUT_IMAGE}"
-
-          sudo sgdisk \
-            -v \
-            "${OUTPUT_IMAGE}"
-
-      - name: Attach image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          LOOP="$(
-            sudo losetup \
-              --find \
-              --show \
-              --partscan \
-              "${OUTPUT_IMAGE}"
-          )"
-
-          echo "LOOP=${LOOP}"
-          echo "LOOP=${LOOP}" >> "${GITHUB_ENV}"
-
-          sleep 3
-
-          lsblk "${LOOP}"
-
-      - name: Inspect HOME filesystem
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Partition 8:"
-
-          sudo blkid \
-            "${LOOP}p8" \
-            || true
-
-          FS="$(
-            sudo blkid \
-              -o value \
-              -s TYPE \
-              "${LOOP}p8" \
-              || true
-          )"
-
-          echo "HOME filesystem: ${FS}"
-
-          echo "HOME_FS=${FS}" >> "${GITHUB_ENV}"
-
-      - name: Resize HOME filesystem
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${HOME_FS}" = "ext4" ]; then
-
-            sudo e2fsck \
-              -f \
-              "${LOOP}p8"
-
-            sudo resize2fs \
-              "${LOOP}p8"
-
-          elif [ "${HOME_FS}" = "btrfs" ]; then
-
-            sudo mkdir -p \
-              "${WORKDIR}/home"
-
-            sudo mount \
-              "${LOOP}p8" \
-              "${WORKDIR}/home"
-
-            sudo btrfs filesystem resize \
-              max \
-              "${WORKDIR}/home"
-
-            sudo umount \
-              "${WORKDIR}/home"
-
-          else
-
-            echo "Filesystem is ${HOME_FS}."
-            echo "Filesystem resize skipped."
-
-          fi
-
-      - name: Create first boot directory
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p \
-            "${WORKDIR}/firstboot"
-
-      - name: Create first boot script
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'set -euo pipefail' \
-            'MARKER="/home/deck/.steamos-auto-grow-done"' \
-            'LOG="/home/deck/.steamos-auto-grow.log"' \
-            'exec >>"$LOG" 2>&1' \
-            'if [ -e "$MARKER" ]; then exit 0; fi' \
-            'ROOT="$(findmnt -n -o SOURCE / || true)"' \
-            'case "$ROOT" in' \
-            '  /dev/nvme*p*) DISK="${ROOT%p[0-9]*}" ;;' \
-            '  /dev/mmcblk*p*) DISK="${ROOT%p[0-9]*}" ;;' \
-            '  /dev/sd[a-z][0-9]*) DISK="${ROOT%%[0-9]*}" ;;' \
-            '  /dev/vd[a-z][0-9]*) DISK="${ROOT%%[0-9]*}" ;;' \
-            '  *) echo "Cannot determine disk from $ROOT"; exit 1 ;;' \
-            'esac' \
-            'if [ ! -b "$DISK" ]; then exit 1; fi' \
-            'sgdisk -e "$DISK"' \
-            'partprobe "$DISK" || true' \
-            'udevadm settle || true' \
-            'case "$DISK" in' \
-            '  /dev/nvme*|/dev/mmcblk*) HOME_PART="${DISK}p8" ;;' \
-            '  *) HOME_PART="${DISK}8" ;;' \
-            'esac' \
-            'if [ ! -b "$HOME_PART" ]; then exit 1; fi' \
-            'START="$(sgdisk -i 8 "$DISK" | awk -F: '"'"'/First sector/{gsub(/[[:space:]]/,"",$2);print $2}'"'"')"' \
-            'LAST="$(sgdisk -E "$DISK")"' \
-            'CURRENT="$(sgdisk -i 8 "$DISK" | awk -F: '"'"'/Last sector/{gsub(/[[:space:]]/,"",$2);print $2}'"'"')"' \
-            'if [ "$CURRENT" -lt "$LAST" ]; then' \
-            '  sgdisk -d 8 "$DISK"' \
-            '  sgdisk -n "8:${START}:${LAST}" -t "8:8300" "$DISK"' \
-            '  sgdisk -e "$DISK"' \
-            '  partprobe "$DISK" || true' \
-            '  udevadm settle || true' \
-            '  sleep 3' \
-            'fi' \
-            'FS="$(blkid -o value -s TYPE "$HOME_PART" 2>/dev/null || true)"' \
-            'case "$FS" in' \
-            '  ext4)' \
-            '    e2fsck -pf "$HOME_PART" || true' \
-            '    resize2fs "$HOME_PART"' \
-            '    ;;' \
-            '  btrfs)' \
-            '    mountpoint -q /home || mount "$HOME_PART" /home' \
-            '    btrfs filesystem resize max /home' \
-            '    ;;' \
-            '  *)' \
-            '    echo "Unsupported filesystem: $FS"' \
-            '    exit 1' \
-            '    ;;' \
-            'esac' \
-            'touch "$MARKER"' \
-            'sync' \
-            > "${WORKDIR}/firstboot/steamos-auto-grow.sh"
-
-          chmod +x \
-            "${WORKDIR}/firstboot/steamos-auto-grow.sh"
-
-      - name: Create first boot service
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          printf '%s\n' \
-            '[Unit]' \
-            'Description=SteamOS automatic disk expansion' \
-            'After=local-fs.target' \
-            'Before=graphical.target' \
-            'ConditionPathExists=!/home/deck/.steamos-auto-grow-done' \
-            '' \
-            '[Service]' \
-            'Type=oneshot' \
-            'ExecStart=/usr/local/sbin/steamos-auto-grow.sh' \
-            'RemainAfterExit=yes' \
-            'TimeoutStartSec=10min' \
-            '' \
-            '[Install]' \
-            'WantedBy=multi-user.target' \
-            > "${WORKDIR}/firstboot/steamos-auto-grow.service"
-
-      - name: Install first boot service in root A
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ROOT_A="${LOOP}p4"
-          ROOT_TYPE="$(
-            sudo blkid \
-              -o value \
-              -s TYPE \
-              "${ROOT_A}" \
-              || true
-          )"
-
-          echo "ROOT-A filesystem: ${ROOT_TYPE}"
-
-          if [ "${ROOT_TYPE}" != "ext4" ] && [ "${ROOT_TYPE}" != "btrfs" ]; then
-            echo "ERROR: ROOT-A is not a writable ext4/btrfs filesystem."
-            echo "The image was built successfully up to this point, but"
-            echo "automatic first-boot injection cannot be performed on this"
-            echo "SteamOS release using direct filesystem modification."
-            exit 1
-          fi
-
-          mkdir -p \
-            "${WORKDIR}/root-a"
-
-          sudo mount \
-            "${ROOT_A}" \
-            "${WORKDIR}/root-a"
-
-          if [ ! -d "${WORKDIR}/root-a/etc" ]; then
-            sudo umount \
-              "${WORKDIR}/root-a"
-
-            echo "ERROR: ROOT-A does not contain /etc."
-            exit 1
-          fi
-
-          sudo mkdir -p \
-            "${WORKDIR}/root-a/usr/local/sbin"
-
-          sudo mkdir -p \
-            "${WORKDIR}/root-a/etc/systemd/system/multi-user.target.wants"
-
-          sudo cp \
-            "${WORKDIR}/firstboot/steamos-auto-grow.sh" \
-            "${WORKDIR}/root-a/usr/local/sbin/steamos-auto-grow.sh"
-
-          sudo cp \
-            "${WORKDIR}/firstboot/steamos-auto-grow.service" \
-            "${WORKDIR}/root-a/etc/systemd/system/steamos-auto-grow.service"
-
-          sudo chmod +x \
-            "${WORKDIR}/root-a/usr/local/sbin/steamos-auto-grow.sh"
-
-          sudo ln -sf \
-            /etc/systemd/system/steamos-auto-grow.service \
-            "${WORKDIR}/root-a/etc/systemd/system/multi-user.target.wants/steamos-auto-grow.service"
-
-          sudo sync
-
-          sudo umount \
-            "${WORKDIR}/root-a"
-
-      - name: Detach image
-        if: always()
-        shell: bash
-        run: |
           set +e
 
-          if [ -n "${LOOP:-}" ]; then
-            sudo umount \
-              "${WORKDIR}/home" \
-              2>/dev/null || true
+          timeout \
+            55m \
+            qemu-system-x86_64 \
+              -enable-kvm \
+              -machine q35 \
+              -cpu host \
+              -smp 4 \
+              -m 8192 \
+              -nodefaults \
+              \
+              -drive \
+                if=pflash,format=raw,readonly=on \
+               ,file="$WORKDIR/ovmf/OVMF_CODE.fd" \
+              \
+              -drive \
+                if=pflash,format=raw \
+                ,file="$WORKDIR/ovmf/OVMF_VARS.fd" \
+              \
+              -device \
+                nvme,drive=recovery \
+              \
+              -drive \
+                id=recovery \
+                ,if=none \
+                ,format=raw \
+                ,file="$RECOVERY_WORKING" \
+              \
+              -device \
+                nvme,drive=target \
+              \
+              -drive \
+                id=target \
+                ,if=none \
+                ,format=raw \
+                ,file="$TARGET" \
+              \
+              -device \
+                virtio-rng-pci \
+              \
+              -device \
+                VGA,vgamem_mb=64 \
+              \
+              -device \
+                usb-ehci \
+              \
+              -device \
+                usb-tablet \
+              \
+              -nic \
+                user,model=virtio-net-pci \
+              \
+              -serial \
+                mon:stdio \
+              \
+              -display \
+                none \
+              \
+              -no-reboot \
+              \
+              > "$WORKDIR/logs/qemu.log" \
+              2>&1
 
-            sudo umount \
-              "${WORKDIR}/root-a" \
-              2>/dev/null || true
+          QEMU_EXIT=$?
 
-            sudo losetup \
-              -d \
-              "${LOOP}" \
-              2>/dev/null || true
+          set -e
+
+          echo
+          echo "QEMU exit code:"
+          echo "$QEMU_EXIT"
+
+          echo
+          echo "=============================================="
+          echo "QEMU LOG"
+          echo "=============================================="
+
+          cat "$WORKDIR/logs/qemu.log" || true
+
+          echo
+          echo "=============================================="
+          echo "TARGET IMAGE"
+          echo "=============================================="
+
+          qemu-img info "$TARGET"
+
+          ls -lh "$TARGET"
+
+          # ----------------------------------------------------------
+          # Don't blindly trust the QEMU exit status.
+          # Check that the target actually contains a partition table.
+          # ----------------------------------------------------------
+
+          echo
+          echo "Checking partition table..."
+
+          if ! command -v fdisk >/dev/null 2>&1; then
+            echo "fdisk unavailable."
+          else
+            fdisk -l "$TARGET" || true
           fi
 
-      - name: Verify final image
+          if command -v sgdisk >/dev/null 2>&1; then
+            sgdisk -p "$TARGET" || true
+          fi
+
+          # A successful SteamOS installation should have a GPT.
+          if ! sgdisk -p "$TARGET" >/dev/null 2>&1; then
+            echo
+            echo "ERROR: target IMG does not contain a readable GPT."
+            echo "The SteamOS installer probably did not run."
+            exit 1
+          fi
+
+          echo
+          echo "GPT detected."
+
+      # ============================================================
+      # VERIFICAR IMAGEN
+      # ============================================================
+
+      - name: Verify installed image
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo sgdisk \
-            -v \
-            "${OUTPUT_IMAGE}"
+          TARGET="$WORKDIR/disk/steamOS-installed.img"
 
-          sudo sgdisk \
-            -p \
-            "${OUTPUT_IMAGE}"
+          echo "=============================================="
+          echo "VERIFYING STEAMOS IMAGE"
+          echo "=============================================="
 
-          ls -lh \
-            "${OUTPUT_IMAGE}"
+          test -f "$TARGET"
+          test "$(stat -c '%s' "$TARGET")" -gt 1000000000
 
-      - name: Calculate SHA256
+          echo
+          echo "Image:"
+          qemu-img info "$TARGET"
+
+          echo
+          echo "GPT:"
+          sgdisk -p "$TARGET"
+
+          echo
+          echo "Partition table:"
+          fdisk -l "$TARGET" || true
+
+          echo
+          echo "SteamOS image passed basic validation."
+
+      # ============================================================
+      # COMPRESIÓN
+      # ============================================================
+
+      - name: Compress installed IMG
+        if: ${{ inputs.compression }}
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "${WORKDIR}"
+          TARGET="$WORKDIR/disk/steamOS-installed.img"
+          OUTPUT="$WORKDIR/output/steamOS-installed.img.zst"
 
-          sha256sum \
-            SteamOS-installed.img \
-            > SteamOS-installed.img.sha256
-
-          cat \
-            SteamOS-installed.img.sha256
-
-      - name: Compress RAW image
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "=============================================="
+          echo "COMPRESSING"
+          echo "=============================================="
 
           zstd \
             -T0 \
             -19 \
-            "${OUTPUT_IMAGE}" \
-            -o "${WORKDIR}/SteamOS-installed.img.zst"
+            --long=27 \
+            --progress \
+            "$TARGET" \
+            -o "$OUTPUT"
 
-          ls -lh \
-            "${WORKDIR}/SteamOS-installed.img" \
-            "${WORKDIR}/SteamOS-installed.img.zst"
+          test -s "$OUTPUT"
 
-      - name: Upload artifacts
+          echo
+          echo "Compressed image:"
+          ls -lh "$OUTPUT"
+
+      # ============================================================
+      # COPIAR IMG SIN COMPRIMIR
+      # ============================================================
+
+      - name: Copy uncompressed IMG
+        if: ${{ !inputs.compression }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp \
+            "$WORKDIR/disk/steamOS-installed.img" \
+            "$WORKDIR/output/steamOS-installed.img"
+
+          ls -lh "$WORKDIR/output/steamOS-installed.img"
+
+      # ============================================================
+      # METADATA
+      # ============================================================
+
+      - name: Create build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="$(cat "$WORKDIR/download/image-name.txt")"
+
+          cat > "$WORKDIR/output/BUILD-INFO.txt" <<EOF
+          SteamOS Automated VM Build
+
+          Recovery image:
+          $IMAGE_NAME
+
+          Target disk:
+          $DISK_SIZE
+
+          Installation method:
+          Valve SteamOS recovery environment
+          QEMU/KVM
+          NVMe virtual target
+
+          Output:
+          steamOS-installed.img
+
+          This image contains the installed SteamOS filesystem
+          and GPT partition table produced by the installer.
+
+          IMPORTANT:
+          Disable Secure Boot on hardware where SteamOS requires it.
+          EOF
+
+          cat "$WORKDIR/output/BUILD-INFO.txt"
+
+      # ============================================================
+      # SUBIR ARTIFACT
+      # ============================================================
+
+      - name: Upload installed SteamOS image
         uses: actions/upload-artifact@v4
         with:
-          name: SteamOS-installed-20260416.1000-3.9.0
-          compression-level: 0
-          if-no-files-found: error
+          name: SteamOS-installed-image
           path: |
-            /home/runner/steamos-build/SteamOS-installed.img
-            /home/runner/steamos-build/SteamOS-installed.img.zst
-            /home/runner/steamos-build/SteamOS-installed.img.sha256
+            /tmp/steamos-build/output/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
