@@ -1,26 +1,26 @@
-name: Build Installed SteamOS IMG
+name: Build Installed SteamOS Image
 
 on:
   workflow_dispatch:
     inputs:
       disk_size:
-        description: "Tamaño del disco SteamOS"
+        description: "Tamaño del disco virtual"
         required: true
         default: "64G"
         type: string
 
       compression:
-        description: "Comprimir el IMG con zstd"
+        description: "Comprimir IMG con zstd"
         required: true
         default: true
         type: boolean
 
 jobs:
-  build-steamos:
-    name: Install SteamOS inside QEMU
+  build:
+    name: Install SteamOS in QEMU
     runs-on: ubuntu-24.04
 
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       WORKDIR: /tmp/steamos-build
@@ -28,34 +28,25 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # PREPARACIÓN
-      # ============================================================
+      # ==========================================================
+      # CHECKOUT
+      # ==========================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show runner information
+      # ==========================================================
+      # DEPENDENCIAS
+      # ==========================================================
+
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
 
           echo "=============================================="
-          echo "STEAMOS BUILD"
+          echo "INSTALLING DEPENDENCIES"
           echo "=============================================="
-
-          uname -a
-          echo
-          lscpu
-          echo
-          free -h
-          echo
-          df -h
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
 
           sudo apt-get update
 
@@ -68,51 +59,27 @@ jobs:
             bzip2 \
             zstd \
             rsync \
-            util-linux \
             gdisk \
+            util-linux \
             dosfstools \
             e2fsprogs \
             btrfs-progs \
             parted \
             pciutils \
-            jq \
-            python3
+            python3 \
+            python3-pip \
+            socat \
+            xz-utils \
+            ca-certificates
 
-      # ============================================================
-      # KVM
-      # ============================================================
+          qemu-system-x86_64 --version
+          qemu-img --version
 
-      - name: Check KVM
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=============================================="
-          echo "KVM"
-          echo "=============================================="
-
-          if [[ ! -e /dev/kvm ]]; then
-            echo "ERROR: /dev/kvm is not available."
-            echo
-            echo "GitHub-hosted runners normally expose KVM,"
-            echo "but this runner does not currently expose it."
-            exit 1
-          fi
-
-          ls -l /dev/kvm
-
-          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-            echo "KVM is accessible."
-          else
-            echo "ERROR: /dev/kvm exists but is not accessible."
-            exit 1
-          fi
-
-      # ============================================================
+      # ==========================================================
       # DIRECTORIOS
-      # ============================================================
+      # ==========================================================
 
-      - name: Create working directories
+      - name: Create build directories
         shell: bash
         run: |
           set -euo pipefail
@@ -125,25 +92,108 @@ jobs:
             "$WORKDIR/disk" \
             "$WORKDIR/ovmf" \
             "$WORKDIR/logs" \
-            "$WORKDIR/output"
+            "$WORKDIR/output" \
+            "$WORKDIR/qmp"
 
-      # ============================================================
-      # OBTENER IMAGEN OFICIAL DE VALVE
-      # ============================================================
+      # ==========================================================
+      # KVM
+      # ==========================================================
 
-      - name: Find latest official SteamOS recovery image
+      - name: Detect KVM
         shell: bash
         run: |
           set -euo pipefail
 
-          INDEX="https://steamdeck-images.steamos.cloud/recovery/"
+          echo "=============================================="
+          echo "KVM DETECTION"
+          echo "=============================================="
+
+          KVM_OK=false
+
+          if [[ -e /dev/kvm ]]; then
+            echo "/dev/kvm exists:"
+            ls -l /dev/kvm
+
+            echo
+            echo "Current user:"
+            id
+
+            echo
+            echo "Testing KVM as root..."
+
+            if sudo test -r /dev/kvm && sudo test -w /dev/kvm; then
+              echo "KVM device is accessible through sudo."
+
+              if sudo qemu-system-x86_64 \
+                -enable-kvm \
+                -machine q35 \
+                -cpu host \
+                -display none \
+                -nodefaults \
+                -S \
+                -monitor none \
+                -serial none \
+                -no-reboot \
+                >/tmp/kvm-test.log 2>&1 &
+              then
+                TEST_PID=$!
+
+                sleep 3
+
+                if kill -0 "$TEST_PID" 2>/dev/null; then
+                  echo "KVM test succeeded."
+
+                  sudo kill "$TEST_PID" 2>/dev/null || true
+                  wait "$TEST_PID" 2>/dev/null || true
+
+                  KVM_OK=true
+                else
+                  echo "QEMU exited during KVM test."
+                  cat /tmp/kvm-test.log || true
+                fi
+              else
+                echo "Could not start QEMU KVM test."
+              fi
+            else
+              echo "Cannot access /dev/kvm through sudo."
+            fi
+          else
+            echo "/dev/kvm does not exist."
+          fi
+
+          echo
+
+          if [[ "$KVM_OK" == "true" ]]; then
+            echo "=============================================="
+            echo "ACCELERATION: KVM"
+            echo "=============================================="
+
+            echo "KVM" > "$WORKDIR/acceleration.txt"
+          else
+            echo "=============================================="
+            echo "ACCELERATION: TCG"
+            echo "=============================================="
+
+            echo "KVM is unavailable."
+            echo "Falling back to software virtualization."
+
+            echo "TCG" > "$WORKDIR/acceleration.txt"
+          fi
+
+      # ==========================================================
+      # STEAMOS RECOVERY INDEX
+      # ==========================================================
+
+      - name: Find latest SteamOS recovery image
+        shell: bash
+        run: |
+          set -euo pipefail
 
           echo "=============================================="
           echo "STEAMOS RECOVERY"
           echo "=============================================="
 
-          echo "Consultando:"
-          echo "$INDEX"
+          INDEX="https://steamdeck-images.steamos.cloud/recovery/"
 
           curl \
             --fail \
@@ -155,43 +205,40 @@ jobs:
             "$INDEX" \
             -o "$WORKDIR/download/index.html"
 
-          echo
-          echo "Imágenes disponibles:"
-          grep -oE \
-            'steamdeck-oobe-repair-[^"]+\.img\.bz2' \
-            "$WORKDIR/download/index.html" \
-            | sort -V \
-            | tail -20 \
-            || true
-
           IMAGE_NAME="$(
             grep -oE \
-              'steamdeck-oobe-repair-[^"]+\.img\.bz2' \
+              'steamdeck-oobe-repair-[0-9.]+-[0-9.]+\.img\.bz2' \
               "$WORKDIR/download/index.html" \
             | sort -V \
             | tail -1
           )"
 
           if [[ -z "$IMAGE_NAME" ]]; then
-            echo
-            echo "ERROR: no se encontró una imagen OOBE recovery."
+            echo "ERROR: Could not find SteamOS recovery image."
             exit 1
           fi
 
           IMAGE_URL="${INDEX}${IMAGE_NAME}"
 
           echo
-          echo "Imagen seleccionada:"
+          echo "Selected image:"
           echo "$IMAGE_NAME"
 
           echo
           echo "URL:"
           echo "$IMAGE_URL"
 
-          printf '%s\n' "$IMAGE_NAME" > "$WORKDIR/download/image-name.txt"
-          printf '%s\n' "$IMAGE_URL" > "$WORKDIR/download/image-url.txt"
+          printf '%s\n' "$IMAGE_NAME" \
+            > "$WORKDIR/download/image-name.txt"
 
-      - name: Download official SteamOS recovery
+          printf '%s\n' "$IMAGE_URL" \
+            > "$WORKDIR/download/image-url.txt"
+
+      # ==========================================================
+      # DOWNLOAD
+      # ==========================================================
+
+      - name: Download SteamOS recovery
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +246,7 @@ jobs:
           IMAGE_NAME="$(cat "$WORKDIR/download/image-name.txt")"
           IMAGE_URL="$(cat "$WORKDIR/download/image-url.txt")"
 
-          echo "Descargando SteamOS:"
+          echo "Downloading:"
           echo "$IMAGE_NAME"
 
           curl \
@@ -217,11 +264,11 @@ jobs:
 
           ls -lh "$WORKDIR/download/$IMAGE_NAME"
 
-      # ============================================================
-      # DESCOMPRIMIR RECOVERY
-      # ============================================================
+      # ==========================================================
+      # EXTRACT
+      # ==========================================================
 
-      - name: Extract SteamOS IMG
+      - name: Extract recovery image
         shell: bash
         run: |
           set -euo pipefail
@@ -232,36 +279,36 @@ jobs:
             "$WORKDIR/download/$IMAGE_NAME" \
             "$WORKDIR/recovery/$IMAGE_NAME"
 
-          echo "Descomprimiendo recovery..."
+          echo "Extracting..."
 
           bunzip2 -f \
             "$WORKDIR/recovery/$IMAGE_NAME"
 
-          RECOVERY_IMG="${IMAGE_NAME%.bz2}"
+          RECOVERY_NAME="${IMAGE_NAME%.bz2}"
 
-          if [[ ! -f "$WORKDIR/recovery/$RECOVERY_IMG" ]]; then
-            echo "ERROR: no se encontró el IMG extraído."
-            exit 1
-          fi
+          test -f "$WORKDIR/recovery/$RECOVERY_NAME"
 
-          echo "Recovery:"
-          ls -lh "$WORKDIR/recovery/$RECOVERY_IMG"
-
-          printf '%s\n' "$RECOVERY_IMG" \
+          printf '%s\n' "$RECOVERY_NAME" \
             > "$WORKDIR/recovery/recovery-name.txt"
 
-      # ============================================================
-      # OVMF
-      # ============================================================
+          echo
+          echo "Recovery image:"
+          ls -lh "$WORKDIR/recovery/$RECOVERY_NAME"
 
-      - name: Prepare UEFI firmware
+          echo
+          qemu-img info \
+            "$WORKDIR/recovery/$RECOVERY_NAME"
+
+      # ==========================================================
+      # OVMF
+      # ==========================================================
+
+      - name: Prepare UEFI
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Buscando OVMF..."
-
-          OVMF_CODE=""
+          CODE=""
 
           for f in \
             /usr/share/OVMF/OVMF_CODE_4M.fd \
@@ -269,43 +316,46 @@ jobs:
             /usr/share/qemu/OVMF_CODE.fd
           do
             if [[ -f "$f" ]]; then
-              OVMF_CODE="$f"
+              CODE="$f"
               break
             fi
           done
 
-          if [[ -z "$OVMF_CODE" ]]; then
-            echo "ERROR: OVMF_CODE no encontrado."
+          if [[ -z "$CODE" ]]; then
+            echo "ERROR: OVMF_CODE not found."
             exit 1
           fi
 
-          echo "OVMF:"
-          echo "$OVMF_CODE"
+          VARS=""
 
-          cp \
-            "$OVMF_CODE" \
+          for f in \
+            /usr/share/OVMF/OVMF_VARS_4M.fd \
+            /usr/share/OVMF/OVMF_VARS.fd
+          do
+            if [[ -f "$f" ]]; then
+              VARS="$f"
+              break
+            fi
+          done
+
+          if [[ -z "$VARS" ]]; then
+            echo "ERROR: OVMF_VARS not found."
+            exit 1
+          fi
+
+          cp "$CODE" \
             "$WORKDIR/ovmf/OVMF_CODE.fd"
 
-          if [[ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]]; then
-            cp \
-              /usr/share/OVMF/OVMF_VARS_4M.fd \
-              "$WORKDIR/ovmf/OVMF_VARS.fd"
-          elif [[ -f /usr/share/OVMF/OVMF_VARS.fd ]]; then
-            cp \
-              /usr/share/OVMF/OVMF_VARS.fd \
-              "$WORKDIR/ovmf/OVMF_VARS.fd"
-          else
-            echo "ERROR: OVMF_VARS no encontrado."
-            exit 1
-          fi
+          cp "$VARS" \
+            "$WORKDIR/ovmf/OVMF_VARS.fd"
 
-          chmod 644 "$WORKDIR/ovmf/"*.fd
+          echo "OVMF prepared."
 
-      # ============================================================
-      # DISCO DESTINO
-      # ============================================================
+      # ==========================================================
+      # TARGET DISK
+      # ==========================================================
 
-      - name: Create virtual SteamOS disk
+      - name: Create target disk
         shell: bash
         run: |
           set -euo pipefail
@@ -313,10 +363,10 @@ jobs:
           TARGET="$WORKDIR/disk/steamOS-installed.img"
 
           echo "=============================================="
-          echo "CREANDO DISCO DESTINO"
+          echo "TARGET DISK"
           echo "=============================================="
 
-          echo "Tamaño:"
+          echo "Size:"
           echo "$DISK_SIZE"
 
           qemu-img create \
@@ -326,141 +376,254 @@ jobs:
 
           qemu-img info "$TARGET"
 
-      # ============================================================
-      # PREPARAR SCRIPT DE INSTALACIÓN
-      # ============================================================
+      # ==========================================================
+      # QMP AUTOMATION SCRIPT
+      # ==========================================================
 
-      - name: Prepare unattended SteamOS installer
+      - name: Create QEMU automation script
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > "$WORKDIR/install-steamos.sh" <<'INSTALLER'
-          #!/usr/bin/env bash
+          cat > "$WORKDIR/qmp/automate.py" <<'PY'
+          import json
+          import socket
+          import sys
+          import time
 
-          set -euo pipefail
+          QMP = sys.argv[1]
 
-          LOG=/tmp/steamos-install.log
+          # QEMU qcodes.
+          SPECIAL = {
+              " ": "spc",
+              "\n": "ret",
+              "\r": "ret",
+              "-": "minus",
+              ".": "dot",
+              "/": "slash",
+              ":": "semicolon",
+              "_": "shift-minus",
+              "=": "equal",
+              "?": "shift-slash",
+              "&": "shift-7",
+              "%": "shift-5",
+              "+": "shift-equal",
+              "@": "shift-2",
+              "#": "shift-3",
+              "'": "apostrophe",
+              '"': "shift-apostrophe",
+              "!": "shift-1",
+              "(": "shift-9",
+              ")": "shift-0",
+          }
 
-          exec > >(tee -a "$LOG") 2>&1
+          def qcode_for_char(c):
+              if c in SPECIAL:
+                  value = SPECIAL[c]
 
-          echo "=============================================="
-          echo "AUTOMATED STEAMOS INSTALLER"
-          echo "=============================================="
+                  if value.startswith("shift-"):
+                      return value.split("-", 1)[1], True
 
-          TARGET="/dev/nvme0n1"
+                  return value, False
 
-          echo "Target disk:"
-          lsblk "$TARGET" || true
+              if "a" <= c <= "z":
+                  return c, False
 
-          echo
-          echo "Searching SteamOS recovery tools..."
+              if "A" <= c <= "Z":
+                  return c.lower(), True
 
-          CANDIDATES=(
-            "/home/deck/tools/repair_device.sh"
-            "/home/deck/Desktop/tools/repair_device.sh"
-            "/root/tools/repair_device.sh"
-            "/usr/bin/repair_device.sh"
+              if "0" <= c <= "9":
+                  return c, False
+
+              raise ValueError(f"Unsupported character: {repr(c)}")
+
+          def command(sock, obj):
+              payload = (json.dumps(obj) + "\r\n").encode()
+              sock.sendall(payload)
+
+              data = b""
+
+              while b"\r\n" not in data:
+                  chunk = sock.recv(65536)
+
+                  if not chunk:
+                      raise RuntimeError("QMP connection closed")
+
+                  data += chunk
+
+              return data
+
+          def key(sock, qcode, down):
+              obj = {
+                  "execute": "input-send-event",
+                  "arguments": {
+                      "events": [
+                          {
+                              "type": "key",
+                              "data": {
+                                  "down": down,
+                                  "key": {
+                                      "type": "qcode",
+                                      "data": qcode
+                                  }
+                              }
+                          }
+                      ]
+                  }
+              }
+
+              command(sock, obj)
+
+          def press(sock, qcode):
+              key(sock, qcode, True)
+              time.sleep(0.015)
+              key(sock, qcode, False)
+              time.sleep(0.015)
+
+          def combo(sock, *keys):
+              for k in keys:
+                  key(sock, k, True)
+
+              time.sleep(0.1)
+
+              for k in reversed(keys):
+                  key(sock, k, False)
+
+              time.sleep(0.2)
+
+          def type_text(sock, text):
+              for c in text:
+                  qcode, shift = qcode_for_char(c)
+
+                  if shift:
+                      key(sock, "shift", True)
+
+                  press(sock, qcode)
+
+                  if shift:
+                      key(sock, "shift", False)
+
+                  time.sleep(0.01)
+
+          print("Waiting for QMP socket...")
+
+          deadline = time.time() + 180
+
+          sock = None
+
+          while time.time() < deadline:
+              try:
+                  sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                  sock.connect(QMP)
+                  break
+              except Exception:
+                  if sock:
+                      sock.close()
+
+                  sock = None
+                  time.sleep(1)
+
+          if sock is None:
+              raise RuntimeError("QMP socket did not appear")
+
+          print("QMP connected.")
+
+          # QEMU greeting.
+          sock.recv(65536)
+
+          command(
+              sock,
+              {
+                  "execute": "qmp_capabilities"
+              }
           )
 
-          REPAIR=""
+          print("Waiting for SteamOS recovery desktop...")
 
-          for f in "${CANDIDATES[@]}"; do
-            if [[ -f "$f" ]]; then
-              REPAIR="$f"
-              break
-            fi
-          done
+          # Recovery needs time to boot KDE.
+          time.sleep(120)
 
-          if [[ -z "$REPAIR" ]]; then
-            echo "Searching filesystem..."
+          print("Opening terminal with Ctrl+Alt+T...")
 
-            REPAIR="$(
-              find /home /root /usr \
-                -type f \
-                -name repair_device.sh \
-                2>/dev/null \
-                | head -1 \
-            )"
-          fi
+          combo(
+              sock,
+              "ctrl",
+              "alt",
+              "t"
+          )
 
-          if [[ -z "$REPAIR" ]]; then
-            echo
-            echo "ERROR: repair_device.sh was not found."
-            echo
-            echo "Recovery contents:"
-            find /home/deck/tools /home/deck/Desktop \
-              -maxdepth 3 \
-              -type f \
-              2>/dev/null \
-              | head -200 || true
+          time.sleep(5)
 
-            exit 1
-          fi
+          # Use the custom installer maintained by louij2.
+          #
+          # It supports:
+          # --disk
+          # --yes
+          # --no-zenity
+          # --poweroff
+          #
+          # See:
+          # https://github.com/louij2/steamos_custom_install
+          #
+          # The recovery environment already contains the SteamOS
+          # installation tooling required by the installer.
 
-          echo
-          echo "Installer:"
-          echo "$REPAIR"
+          cmd = (
+              "rm -rf /tmp/steamos_custom_install; "
+              "curl -L --fail "
+              "https://github.com/louij2/steamos_custom_install/archive/refs/heads/main.tar.gz "
+              "-o /tmp/steamos.tar.gz; "
+              "mkdir -p /tmp/steamos_custom_install; "
+              "tar -xzf /tmp/steamos.tar.gz "
+              "--strip-components=1 "
+              "-C /tmp/steamos_custom_install; "
+              "chmod +x /tmp/steamos_custom_install/repair_device.sh; "
+              "sudo env NOPROMPT=1 NOZENITY=1 POWEROFF=1 "
+              "/tmp/steamos_custom_install/repair_device.sh "
+              "--disk /dev/nvme1n1 "
+              "--yes "
+              "--no-zenity "
+              "--poweroff "
+              "all"
+          )
 
-          chmod +x "$REPAIR"
+          print("Sending installation command...")
 
-          echo
-          echo "Patching installer target disk..."
+          type_text(sock, cmd)
 
-          cp "$REPAIR" /tmp/repair_device.sh.original
+          press(sock, "ret")
 
-          sed \
-            -i \
-            's#^DISK=/dev/nvme0n1$#DISK=/dev/nvme0n1#' \
-            "$REPAIR"
+          print("Installation command sent.")
 
-          sed \
-            -i \
-            's/^DISK_SUFFIX=p$/DISK_SUFFIX=p/' \
-            "$REPAIR"
+          # Do not send more keys.
+          #
+          # The installer is destructive and may take a long time.
+          # It should shut down the VM when finished.
+          #
+          # We remain alive and monitor QMP.
 
-          echo
-          echo "Executing SteamOS installer..."
+          while True:
+              time.sleep(10)
 
-          export NOPROMPT=1
-          export POWEROFF=1
+              try:
+                  command(
+                      sock,
+                      {
+                          "execute": "query-status"
+                      }
+                  )
+              except Exception:
+                  print("QEMU connection closed.")
+                  break
+          PY
 
-          "$REPAIR" all
+          chmod +x "$WORKDIR/qmp/automate.py"
 
-          echo
-          echo "=============================================="
-          echo "INSTALLER FINISHED"
-          echo "=============================================="
+      # ==========================================================
+      # START QEMU
+      # ==========================================================
 
-          sync
-
-          echo
-          echo "Target disk:"
-          lsblk "$TARGET" || true
-
-          echo
-          echo "Filesystem signatures:"
-          blkid "$TARGET"* || true
-
-          echo
-          echo "Installation complete."
-
-          # Keep the VM alive long enough for QEMU to observe the result.
-          touch /tmp/STEAMOS_INSTALL_COMPLETE
-
-          sleep 10
-
-          poweroff -f || true
-
-          INSTALLER
-
-          chmod +x "$WORKDIR/install-steamos.sh"
-
-      # ============================================================
-      # BOOT RECOVERY + INSTALL
-      # ============================================================
-
-      - name: Boot SteamOS recovery and install to virtual disk
+      - name: Start SteamOS VM
         shell: bash
         run: |
           set -euo pipefail
@@ -470,169 +633,219 @@ jobs:
           RECOVERY="$WORKDIR/recovery/$RECOVERY_NAME"
           TARGET="$WORKDIR/disk/steamOS-installed.img"
 
+          QMP="$WORKDIR/qmp/qmp.sock"
+
+          ACCEL="$(cat "$WORKDIR/acceleration.txt")"
+
+          rm -f "$QMP"
+
           echo "=============================================="
-          echo "QEMU STEAMOS INSTALLATION"
-          echo "=============================================="
-
-          echo "Recovery:"
-          echo "$RECOVERY"
-
-          echo "Target:"
-          echo "$TARGET"
-
-          test -f "$RECOVERY"
-          test -f "$TARGET"
-
-          # ----------------------------------------------------------
-          # Inject installer into the recovery image.
-          #
-          # We use a writable copy because the original Valve image
-          # must remain untouched.
-          # ----------------------------------------------------------
-
-          cp \
-            "$RECOVERY" \
-            "$WORKDIR/recovery/recovery-working.img"
-
-          RECOVERY_WORKING="$WORKDIR/recovery/recovery-working.img"
-
-          echo
-          echo "Recovery image:"
-          qemu-img info "$RECOVERY_WORKING"
-
-          # ----------------------------------------------------------
-          # Start VM.
-          #
-          # The recovery image is the first NVMe disk.
-          # The destination is the second NVMe disk.
-          #
-          # SteamOS recovery expects an NVMe-style destination.
-          # ----------------------------------------------------------
-
-          rm -f "$WORKDIR/logs/qemu.log"
-
-          set +e
-
-          timeout \
-            55m \
-            qemu-system-x86_64 \
-              -enable-kvm \
-              -machine q35 \
-              -cpu host \
-              -smp 4 \
-              -m 8192 \
-              -nodefaults \
-              \
-              -drive \
-                if=pflash,format=raw,readonly=on \
-               ,file="$WORKDIR/ovmf/OVMF_CODE.fd" \
-              \
-              -drive \
-                if=pflash,format=raw \
-                ,file="$WORKDIR/ovmf/OVMF_VARS.fd" \
-              \
-              -device \
-                nvme,drive=recovery \
-              \
-              -drive \
-                id=recovery \
-                ,if=none \
-                ,format=raw \
-                ,file="$RECOVERY_WORKING" \
-              \
-              -device \
-                nvme,drive=target \
-              \
-              -drive \
-                id=target \
-                ,if=none \
-                ,format=raw \
-                ,file="$TARGET" \
-              \
-              -device \
-                virtio-rng-pci \
-              \
-              -device \
-                VGA,vgamem_mb=64 \
-              \
-              -device \
-                usb-ehci \
-              \
-              -device \
-                usb-tablet \
-              \
-              -nic \
-                user,model=virtio-net-pci \
-              \
-              -serial \
-                mon:stdio \
-              \
-              -display \
-                none \
-              \
-              -no-reboot \
-              \
-              > "$WORKDIR/logs/qemu.log" \
-              2>&1
-
-          QEMU_EXIT=$?
-
-          set -e
-
-          echo
-          echo "QEMU exit code:"
-          echo "$QEMU_EXIT"
-
-          echo
-          echo "=============================================="
-          echo "QEMU LOG"
+          echo "STARTING STEAMOS VM"
           echo "=============================================="
 
-          cat "$WORKDIR/logs/qemu.log" || true
+          echo "Acceleration:"
+          echo "$ACCEL"
 
-          echo
-          echo "=============================================="
-          echo "TARGET IMAGE"
-          echo "=============================================="
+          QEMU_ACCEL=()
 
-          qemu-img info "$TARGET"
-
-          ls -lh "$TARGET"
-
-          # ----------------------------------------------------------
-          # Don't blindly trust the QEMU exit status.
-          # Check that the target actually contains a partition table.
-          # ----------------------------------------------------------
-
-          echo
-          echo "Checking partition table..."
-
-          if ! command -v fdisk >/dev/null 2>&1; then
-            echo "fdisk unavailable."
+          if [[ "$ACCEL" == "KVM" ]]; then
+            QEMU_ACCEL=(
+              -enable-kvm
+              -cpu host
+            )
           else
-            fdisk -l "$TARGET" || true
+            QEMU_ACCEL=(
+              -accel tcg,thread=multi
+              -cpu max
+            )
           fi
 
-          if command -v sgdisk >/dev/null 2>&1; then
-            sgdisk -p "$TARGET" || true
-          fi
+          sudo qemu-system-x86_64 \
+            "${QEMU_ACCEL[@]}" \
+            -machine q35 \
+            -smp 4 \
+            -m 8192 \
+            \
+            -drive \
+              if=pflash,format=raw,readonly=on \
+              ,file="$WORKDIR/ovmf/OVMF_CODE.fd" \
+            \
+            -drive \
+              if=pflash,format=raw \
+              ,file="$WORKDIR/ovmf/OVMF_VARS.fd" \
+            \
+            -drive \
+              id=recovery \
+              ,if=none \
+              ,format=raw \
+              ,file="$RECOVERY" \
+            \
+            -device \
+              nvme,drive=recovery,serial=RECOVERY0001 \
+            \
+            -drive \
+              id=target \
+              ,if=none \
+              ,format=raw \
+              ,file="$TARGET" \
+            \
+            -device \
+              nvme,drive=target,serial=TARGET0001 \
+            \
+            -device \
+              virtio-rng-pci \
+            \
+            -device \
+              virtio-net-pci,netdev=net0 \
+            \
+            -netdev \
+              user,id=net0 \
+            \
+            -device \
+              virtio-vga \
+            \
+            -display \
+              none \
+            \
+            -vnc \
+              127.0.0.1:0 \
+            \
+            -qmp \
+              unix:"$QMP",server=on,wait=off \
+            \
+            -serial \
+              file:"$WORKDIR/logs/serial.log" \
+            \
+            -monitor \
+              none \
+            \
+            -no-reboot \
+            \
+            > "$WORKDIR/logs/qemu.log" \
+            2>&1 &
 
-          # A successful SteamOS installation should have a GPT.
-          if ! sgdisk -p "$TARGET" >/dev/null 2>&1; then
-            echo
-            echo "ERROR: target IMG does not contain a readable GPT."
-            echo "The SteamOS installer probably did not run."
+          QEMU_PID=$!
+
+          echo "$QEMU_PID" \
+            > "$WORKDIR/qemu.pid"
+
+          echo "QEMU PID:"
+          echo "$QEMU_PID"
+
+          echo "QMP:"
+          echo "$QMP"
+
+      # ==========================================================
+      # AUTOMATIZAR EL TERMINAL DEL RECOVERY
+      # ==========================================================
+
+      - name: Run unattended SteamOS installer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          QMP="$WORKDIR/qmp/qmp.sock"
+
+          echo "Waiting for QEMU..."
+
+          for i in $(seq 1 180); do
+            if [[ -S "$QMP" ]]; then
+              echo "QMP socket available."
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [[ ! -S "$QMP" ]]; then
+            echo "ERROR: QMP socket never appeared."
+
+            cat "$WORKDIR/logs/qemu.log" || true
+
             exit 1
           fi
 
           echo
-          echo "GPT detected."
+          echo "Starting automated recovery installation."
 
-      # ============================================================
-      # VERIFICAR IMAGEN
-      # ============================================================
+          python3 \
+            "$WORKDIR/qmp/automate.py" \
+            "$QMP" \
+            > "$WORKDIR/logs/automation.log" \
+            2>&1 &
 
-      - name: Verify installed image
+          AUTOMATION_PID=$!
+
+          echo "$AUTOMATION_PID" \
+            > "$WORKDIR/automation.pid"
+
+          echo "Automation PID:"
+          echo "$AUTOMATION_PID"
+
+          # Wait for the installer process.
+          #
+          # The installer normally powers off the guest when finished.
+          # Give it up to 75 minutes.
+
+          for i in $(seq 1 450); do
+
+            if [[ ! -e "$WORKDIR/qemu.pid" ]]; then
+              break
+            fi
+
+            QPID="$(cat "$WORKDIR/qemu.pid")"
+
+            if ! sudo kill -0 "$QPID" 2>/dev/null; then
+              echo "QEMU has stopped."
+              break
+            fi
+
+            if [[ -f "$WORKDIR/disk/steamOS-installed.img" ]]; then
+              SIZE="$(stat -c '%s' "$WORKDIR/disk/steamOS-installed.img")"
+
+              if [[ "$SIZE" -gt 1000000000 ]]; then
+                echo "Target IMG exists."
+              fi
+            fi
+
+            sleep 10
+          done
+
+          echo
+          echo "Automation log:"
+          cat "$WORKDIR/logs/automation.log" || true
+
+          echo
+          echo "QEMU log:"
+          cat "$WORKDIR/logs/qemu.log" || true
+
+      # ==========================================================
+      # STOP VM IF NECESSARY
+      # ==========================================================
+
+      - name: Stop VM
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [[ -f "$WORKDIR/qemu.pid" ]]; then
+            PID="$(cat "$WORKDIR/qemu.pid")"
+
+            echo "Stopping QEMU PID $PID..."
+
+            sudo kill "$PID" 2>/dev/null || true
+
+            sleep 5
+
+            sudo kill -9 "$PID" 2>/dev/null || true
+          fi
+
+      # ==========================================================
+      # VALIDATE IMAGE
+      # ==========================================================
+
+      - name: Validate installed SteamOS image
         shell: bash
         run: |
           set -euo pipefail
@@ -640,64 +853,50 @@ jobs:
           TARGET="$WORKDIR/disk/steamOS-installed.img"
 
           echo "=============================================="
-          echo "VERIFYING STEAMOS IMAGE"
+          echo "VALIDATING FINAL IMAGE"
           echo "=============================================="
 
-          test -f "$TARGET"
-          test "$(stat -c '%s' "$TARGET")" -gt 1000000000
+          if [[ ! -f "$TARGET" ]]; then
+            echo "ERROR: SteamOS IMG was not created."
+            exit 1
+          fi
+
+          SIZE="$(stat -c '%s' "$TARGET")"
+
+          echo "IMG size:"
+          numfmt --to=iec "$SIZE"
+
+          if [[ "$SIZE" -lt 1000000000 ]]; then
+            echo "ERROR: IMG is unexpectedly small."
+            exit 1
+          fi
 
           echo
-          echo "Image:"
+          echo "QEMU image information:"
+
           qemu-img info "$TARGET"
 
           echo
-          echo "GPT:"
-          sgdisk -p "$TARGET"
+          echo "GPT information:"
+
+          if ! sudo sgdisk -p "$TARGET"; then
+            echo "ERROR: final image has no readable GPT."
+            exit 1
+          fi
 
           echo
           echo "Partition table:"
-          fdisk -l "$TARGET" || true
+
+          sudo fdisk -l "$TARGET" || true
 
           echo
-          echo "SteamOS image passed basic validation."
+          echo "SteamOS installation image looks valid."
 
-      # ============================================================
-      # COMPRESIÓN
-      # ============================================================
+      # ==========================================================
+      # FINAL IMAGE
+      # ==========================================================
 
-      - name: Compress installed IMG
-        if: ${{ inputs.compression }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TARGET="$WORKDIR/disk/steamOS-installed.img"
-          OUTPUT="$WORKDIR/output/steamOS-installed.img.zst"
-
-          echo "=============================================="
-          echo "COMPRESSING"
-          echo "=============================================="
-
-          zstd \
-            -T0 \
-            -19 \
-            --long=27 \
-            --progress \
-            "$TARGET" \
-            -o "$OUTPUT"
-
-          test -s "$OUTPUT"
-
-          echo
-          echo "Compressed image:"
-          ls -lh "$OUTPUT"
-
-      # ============================================================
-      # COPIAR IMG SIN COMPRIMIR
-      # ============================================================
-
-      - name: Copy uncompressed IMG
-        if: ${{ !inputs.compression }}
+      - name: Prepare uncompressed artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -706,50 +905,85 @@ jobs:
             "$WORKDIR/disk/steamOS-installed.img" \
             "$WORKDIR/output/steamOS-installed.img"
 
-          ls -lh "$WORKDIR/output/steamOS-installed.img"
+          ls -lh \
+            "$WORKDIR/output/steamOS-installed.img"
 
-      # ============================================================
+      # ==========================================================
+      # COMPRESS
+      # ==========================================================
+
+      - name: Compress final IMG
+        if: ${{ inputs.compression }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          zstd \
+            -T0 \
+            -19 \
+            --long=27 \
+            --progress \
+            "$WORKDIR/output/steamOS-installed.img" \
+            -o "$WORKDIR/output/steamOS-installed.img.zst"
+
+          rm \
+            "$WORKDIR/output/steamOS-installed.img"
+
+          ls -lh "$WORKDIR/output/"
+
+      # ==========================================================
       # METADATA
-      # ============================================================
+      # ==========================================================
 
-      - name: Create build metadata
+      - name: Write build information
         shell: bash
         run: |
           set -euo pipefail
 
           IMAGE_NAME="$(cat "$WORKDIR/download/image-name.txt")"
+          ACCEL="$(cat "$WORKDIR/acceleration.txt")"
 
           cat > "$WORKDIR/output/BUILD-INFO.txt" <<EOF
-          SteamOS Automated VM Build
+          SteamOS Installed Image
+          =======================
 
-          Recovery image:
+          Recovery:
           $IMAGE_NAME
 
-          Target disk:
+          Virtual disk:
           $DISK_SIZE
 
-          Installation method:
-          Valve SteamOS recovery environment
-          QEMU/KVM
-          NVMe virtual target
+          QEMU acceleration:
+          $ACCEL
+
+          Installer:
+          louij2/steamos_custom_install
+
+          Target:
+          /dev/nvme1n1
+
+          Installation:
+          Automated
 
           Output:
-          steamOS-installed.img
+          SteamOS installed GPT image
 
-          This image contains the installed SteamOS filesystem
-          and GPT partition table produced by the installer.
+          The image is intended to be written directly to a physical
+          disk/SSD/USB device.
 
           IMPORTANT:
-          Disable Secure Boot on hardware where SteamOS requires it.
+          This image was produced in a virtual machine. Hardware-specific
+          Steam Deck firmware/controller updates were not intentionally
+          applied to the target image.
           EOF
 
           cat "$WORKDIR/output/BUILD-INFO.txt"
 
-      # ============================================================
-      # SUBIR ARTIFACT
-      # ============================================================
+      # ==========================================================
+      # ARTIFACT
+      # ==========================================================
 
-      - name: Upload installed SteamOS image
+      - name: Upload SteamOS image
         uses: actions/upload-artifact@v4
         with:
           name: SteamOS-installed-image
@@ -757,4 +991,21 @@ jobs:
             /tmp/steamos-build/output/*
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+      # ==========================================================
+      # LOGS SI FALLA
+      # ==========================================================
+
+      - name: Upload VM logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteamOS-build-logs
+          path: |
+            /tmp/steamos-build/logs/*
+            /tmp/steamos-build/download/image-name.txt
+            /tmp/steamos-build/download/image-url.txt
+            /tmp/steamos-build/acceleration.txt
+          if-no-files-found: ignore
           retention-days: 7
