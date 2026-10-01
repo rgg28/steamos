@@ -8,40 +8,21 @@ permissions:
 
 jobs:
   build-steamos:
-    name: Build SteamOS Installed RAW
+    name: Build SteamOS RAW
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     env:
       STEAMOS_VERSION: "20260416.1000"
       STEAMOS_RELEASE: "3.9.0"
-
       STEAMOS_URL: "https://steamdeck-images.steamos.cloud/steamdeck/20260416.1000/steamdeck-20260416.1000-3.9.0.img.zst"
-
-      # Imagen base que construiremos.
-      BASE_IMAGE: "/home/runner/steamos-build/downloads/steamos-source.img"
-
-      # Resultado.
-      FINAL_IMAGE: "/home/runner/steamos-build/output/SteamOS-installed.img"
-
-      # Tamaño inicial de la imagen.
-      # Se puede flashear después a discos mayores.
       IMAGE_SIZE: "64G"
-
       WORKDIR: "/home/runner/steamos-build"
 
     steps:
 
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      # ============================================================
-      # DEPENDENCIAS
-      # ============================================================
 
       - name: Install dependencies
         shell: bash
@@ -62,17 +43,11 @@ jobs:
             file \
             curl \
             coreutils \
-            qemu-utils \
-            kpartx \
-            systemd-container
+            qemu-utils
 
           mkdir -p "${WORKDIR}/downloads"
           mkdir -p "${WORKDIR}/output"
           mkdir -p "${WORKDIR}/mount"
-
-      # ============================================================
-      # DESCARGAR STEAMOS OFICIAL
-      # ============================================================
 
       - name: Download official SteamOS image
         shell: bash
@@ -91,15 +66,8 @@ jobs:
             -o steamos.img.zst \
             "${STEAMOS_URL}"
 
-          echo
-          echo "Imagen descargada:"
           ls -lh steamos.img.zst
-
           file steamos.img.zst
-
-      # ============================================================
-      # DESCOMPRIMIR
-      # ============================================================
 
       - name: Decompress SteamOS image
         shell: bash
@@ -114,59 +82,86 @@ jobs:
             steamos.img.zst \
             -o steamos-source.img
 
-          echo
-          echo "Imagen RAW:"
           ls -lh steamos-source.img
-
           file steamos-source.img
 
-      # ============================================================
-      # INSPECCIONAR GPT
-      # ============================================================
-
-      - name: Inspect SteamOS GPT
+      - name: Inspect SteamOS image
         shell: bash
         run: |
           set -euxo pipefail
 
-          sudo sgdisk -v "${BASE_IMAGE}"
-
-          echo
           echo "=============================================="
-          echo "STEAMOS PARTITIONS"
+          echo "STEAMOS GPT"
           echo "=============================================="
 
-          sudo sgdisk -p "${BASE_IMAGE}"
+          sudo sgdisk -v "${WORKDIR}/downloads/steamos-source.img"
+          sudo sgdisk -p "${WORKDIR}/downloads/steamos-source.img"
 
-      # ============================================================
-      # OBTENER INFORMACIÓN DE HOME
-      # ============================================================
-
-      - name: Detect SteamOS HOME partition
+      - name: Validate SteamOS partition 8
         shell: bash
         run: |
           set -euxo pipefail
 
-          HOME_INFO="$(
-            sudo sgdisk -i 8 "${BASE_IMAGE}"
-          )"
+          IMG="${WORKDIR}/downloads/steamos-source.img"
 
-          echo "${HOME_INFO}"
+          if ! sudo sgdisk -i 8 "${IMG}" >/dev/null 2>&1; then
+            echo "ERROR: no existe la partición 8."
+            sudo sgdisk -p "${IMG}"
+            exit 1
+          fi
+
+          sudo sgdisk -i 8 "${IMG}"
+
+      - name: Create 64 GiB image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          truncate \
+            -s "${IMAGE_SIZE}" \
+            "${WORKDIR}/output/SteamOS-installed.img"
+
+          ls -lh "${WORKDIR}/output/SteamOS-installed.img"
+
+      - name: Copy official SteamOS image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SOURCE="${WORKDIR}/downloads/steamos-source.img"
+          TARGET="${WORKDIR}/output/SteamOS-installed.img"
+
+          SOURCE_SIZE="$(stat -c '%s' "${SOURCE}")"
+          TARGET_SIZE="$(stat -c '%s' "${TARGET}")"
+
+          echo "SOURCE_SIZE=${SOURCE_SIZE}"
+          echo "TARGET_SIZE=${TARGET_SIZE}"
+
+          if [ "${SOURCE_SIZE}" -gt "${TARGET_SIZE}" ]; then
+            echo "ERROR: la imagen oficial es mayor que ${IMAGE_SIZE}."
+            exit 1
+          fi
+
+          dd \
+            if="${SOURCE}" \
+            of="${TARGET}" \
+            bs=64M \
+            conv=notrunc \
+            status=progress
+
+          sync
+
+      - name: Get HOME partition start
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IMG="${WORKDIR}/output/SteamOS-installed.img"
 
           HOME_START="$(
-            echo "${HOME_INFO}" |
+            sudo sgdisk -i 8 "${IMG}" |
             awk -F: '
               /First sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
-
-          HOME_END="$(
-            echo "${HOME_INFO}" |
-            awk -F: '
-              /Last sector/ {
                 gsub(/[[:space:]]/, "", $2)
                 print $2
               }
@@ -174,204 +169,68 @@ jobs:
           )"
 
           if [ -z "${HOME_START}" ]; then
-            echo "ERROR: no se pudo obtener el inicio de HOME."
-            exit 1
-          fi
-
-          if [ -z "${HOME_END}" ]; then
-            echo "ERROR: no se pudo obtener el final de HOME."
+            echo "ERROR: no se pudo obtener HOME_START."
             exit 1
           fi
 
           echo "HOME_START=${HOME_START}"
-          echo "HOME_END=${HOME_END}"
-
           echo "HOME_START=${HOME_START}" >> "${GITHUB_ENV}"
-          echo "HOME_END=${HOME_END}" >> "${GITHUB_ENV}"
-
-      # ============================================================
-      # CREAR IMAGEN FINAL
-      # ============================================================
-
-      - name: Create final 64 GiB RAW
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          rm -f "${FINAL_IMAGE}"
-
-          truncate \
-            -s "${IMAGE_SIZE}" \
-            "${FINAL_IMAGE}"
-
-          ls -lh "${FINAL_IMAGE}"
-
-      # ============================================================
-      # COPIAR IMAGEN OFICIAL
-      # ============================================================
-
-      - name: Copy official SteamOS image
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          SOURCE_SIZE="$(
-            stat -c '%s' "${BASE_IMAGE}"
-          )"
-
-          TARGET_SIZE="$(
-            stat -c '%s' "${FINAL_IMAGE}"
-          )"
-
-          echo "SOURCE_SIZE=${SOURCE_SIZE}"
-          echo "TARGET_SIZE=${TARGET_SIZE}"
-
-          if [ "${SOURCE_SIZE}" -gt "${TARGET_SIZE}" ]; then
-            echo "ERROR: la imagen base es mayor que ${IMAGE_SIZE}."
-            exit 1
-          fi
-
-          dd \
-            if="${BASE_IMAGE}" \
-            of="${FINAL_IMAGE}" \
-            bs=64M \
-            conv=notrunc \
-            status=progress
-
-          sync
-
-      # ============================================================
-      # EXPANDIR GPT
-      # ============================================================
 
       - name: Expand GPT
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "Moviendo GPT secundaria al final..."
+          IMG="${WORKDIR}/output/SteamOS-installed.img"
 
-          sudo sgdisk \
-            -e \
-            "${FINAL_IMAGE}"
+          sudo sgdisk -e "${IMG}"
 
-          echo
-          sudo sgdisk -v "${FINAL_IMAGE}"
+          sudo sgdisk -v "${IMG}"
 
-      # ============================================================
-      # CALCULAR ÚLTIMO SECTOR
-      # ============================================================
-
-      - name: Calculate image last sector
+      - name: Get final sector
         shell: bash
         run: |
           set -euxo pipefail
 
-          LAST_SECTOR="$(
-            sudo sgdisk -E "${FINAL_IMAGE}"
-          )"
+          IMG="${WORKDIR}/output/SteamOS-installed.img"
+
+          LAST_SECTOR="$(sudo sgdisk -E "${IMG}")"
 
           if [ -z "${LAST_SECTOR}" ]; then
-            echo "ERROR: no se pudo determinar el último sector."
+            echo "ERROR: no se pudo obtener LAST_SECTOR."
             exit 1
           fi
 
           echo "LAST_SECTOR=${LAST_SECTOR}"
           echo "LAST_SECTOR=${LAST_SECTOR}" >> "${GITHUB_ENV}"
 
-      # ============================================================
-      # EXTENDER PARTICIÓN 8
-      # ============================================================
-
-      - name: Expand HOME partition to image end
+      - name: Expand HOME partition
         shell: bash
         run: |
           set -euxo pipefail
+
+          IMG="${WORKDIR}/output/SteamOS-installed.img"
 
           echo "HOME_START=${HOME_START}"
           echo "LAST_SECTOR=${LAST_SECTOR}"
 
           sudo sgdisk \
             -d 8 \
-            "${FINAL_IMAGE}"
+            "${IMG}"
 
           sudo sgdisk \
             -n "8:${HOME_START}:${LAST_SECTOR}" \
             -t "8:8300" \
-            "${FINAL_IMAGE}"
+            "${IMG}"
 
           sudo sgdisk \
             -e \
-            "${FINAL_IMAGE}"
+            "${IMG}"
 
-          sync
+          sudo sgdisk -v "${IMG}"
+          sudo sgdisk -i 8 "${IMG}"
 
-      # ============================================================
-      # VERIFICAR GPT
-      # ============================================================
-
-      - name: Verify expanded GPT
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          sudo sgdisk -v "${FINAL_IMAGE}"
-
-          echo
-          sudo sgdisk -p "${FINAL_IMAGE}"
-
-          echo
-          sudo sgdisk -i 8 "${FINAL_IMAGE}"
-
-      # ============================================================
-      # OBTENER OFFSETS
-      # ============================================================
-
-      - name: Calculate partition offsets
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          PART8_START="$(
-            sudo sgdisk -i 8 "${FINAL_IMAGE}" |
-            awk -F: '
-              /First sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
-
-          PART8_END="$(
-            sudo sgdisk -i 8 "${FINAL_IMAGE}" |
-            awk -F: '
-              /Last sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
-
-          SECTOR_SIZE=512
-
-          PART8_OFFSET=$((PART8_START * SECTOR_SIZE))
-          PART8_BYTES=$(((PART8_END - PART8_START + 1) * SECTOR_SIZE))
-
-          echo "PART8_START=${PART8_START}"
-          echo "PART8_END=${PART8_END}"
-          echo "PART8_OFFSET=${PART8_OFFSET}"
-          echo "PART8_BYTES=${PART8_BYTES}"
-
-          echo "PART8_START=${PART8_START}" >> "${GITHUB_ENV}"
-          echo "PART8_END=${PART8_END}" >> "${GITHUB_ENV}"
-          echo "PART8_OFFSET=${PART8_OFFSET}" >> "${GITHUB_ENV}"
-          echo "PART8_BYTES=${PART8_BYTES}" >> "${GITHUB_ENV}"
-
-      # ============================================================
-      # CONECTAR IMAGEN COMO LOOP DEVICE
-      # ============================================================
-
-      - name: Attach final image
+      - name: Attach image
         shell: bash
         run: |
           set -euxo pipefail
@@ -381,7 +240,7 @@ jobs:
               --find \
               --show \
               --partscan \
-              "${FINAL_IMAGE}"
+              "${WORKDIR}/output/SteamOS-installed.img"
           )"
 
           echo "LOOP_DEVICE=${LOOP_DEVICE}"
@@ -391,35 +250,7 @@ jobs:
 
           lsblk "${LOOP_DEVICE}"
 
-      # ============================================================
-      # COMPROBAR HOME
-      # ============================================================
-
-      - name: Inspect HOME filesystem
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "Partición:"
-          lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTUUID "${LOOP_DEVICE}"
-
-          echo
-          echo "Partición 8:"
-          sudo blkid "${LOOP_DEVICE}p8" || true
-
-      # ============================================================
-      # RESIZE DEL FILESYSTEM
-      #
-      # IMPORTANTE:
-      #
-      # Primero hacemos que el filesystem ocupe la nueva partición.
-      # Si el filesystem no es ext4, el workflow falla.
-      #
-      # Esto nos da una imagen que ya ocupa todo su disco base de
-      # 64 GiB.
-      # ============================================================
-
-      - name: Expand HOME filesystem
+      - name: Detect HOME filesystem
         shell: bash
         run: |
           set -euxo pipefail
@@ -432,7 +263,13 @@ jobs:
               || true
           )"
 
-          echo "Filesystem HOME: ${FS_TYPE}"
+          echo "HOME filesystem: ${FS_TYPE}"
+          echo "FS_TYPE=${FS_TYPE}" >> "${GITHUB_ENV}"
+
+      - name: Expand HOME filesystem
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           if [ "${FS_TYPE}" = "ext4" ]; then
 
@@ -446,368 +283,266 @@ jobs:
           elif [ "${FS_TYPE}" = "btrfs" ]; then
 
             echo "HOME usa Btrfs."
-            echo "La expansión final se realizará en el primer arranque."
+            echo "La expansión al disco físico se hará en primer arranque."
 
           else
 
-            echo "Filesystem desconocido: ${FS_TYPE}"
-            echo "No se modificará destructivamente."
+            echo "Filesystem HOME: ${FS_TYPE}"
+            echo "No se realizará resize destructivo."
+
           fi
 
-      # ============================================================
-      # CREAR SCRIPT DE PRIMER ARRANQUE
-      #
-      # Este script NO asume que el disco físico sea de 64 GiB.
-      #
-      # En el primer arranque:
-      #
-      #   1. detecta el disco raíz
-      #   2. mueve GPT al final
-      #   3. detecta HOME
-      #   4. extiende HOME
-      #   5. crece el filesystem
-      #   6. se deshabilita
-      #
-      # ============================================================
-
-      - name: Create first boot expansion script
+      - name: Create first boot directory
         shell: bash
         run: |
           set -euxo pipefail
 
-          FIRST_BOOT_DIR="${WORKDIR}/firstboot"
+          rm -rf "${WORKDIR}/firstboot"
+
+          mkdir -p \
+            "${WORKDIR}/firstboot"
+
+      - name: Generate first boot script
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - "${WORKDIR}/firstboot/steamos-firstboot-grow.sh" <<'PY'
+          import sys
+
+          output = sys.argv[1]
+
+          script = r'''#!/usr/bin/env bash
+
+          set -u
+
+          LOG="/home/deck/steamos-firstboot-grow.log"
+
+          exec >> "${LOG}" 2>&1
+
+          echo "=============================================="
+          echo "SteamOS automatic disk expansion"
+          echo "=============================================="
+          date
+
+          ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
+
+          echo "ROOT_SOURCE=${ROOT_SOURCE}"
+
+          case "${ROOT_SOURCE}" in
+              /dev/nvme*p*)
+                  DISK="${ROOT_SOURCE%p*}"
+                  HOME_PART="${DISK}p8"
+                  ;;
+              /dev/mmcblk*p*)
+                  DISK="${ROOT_SOURCE%p*}"
+                  HOME_PART="${DISK}p8"
+                  ;;
+              /dev/sd[a-z][0-9]*)
+                  DISK="${ROOT_SOURCE%%[0-9]*}"
+                  HOME_PART="${DISK}8"
+                  ;;
+              /dev/vd[a-z][0-9]*)
+                  DISK="${ROOT_SOURCE%%[0-9]*}"
+                  HOME_PART="${DISK}8"
+                  ;;
+              *)
+                  echo "No se pudo determinar el disco."
+                  exit 1
+                  ;;
+          esac
 
-          rm -rf "${FIRST_BOOT_DIR}"
-          mkdir -p "${FIRST_BOOT_DIR}"
+          echo "DISK=${DISK}"
+          echo "HOME_PART=${HOME_PART}"
 
-          cat > "${FIRST_BOOT_DIR}/steamos-firstboot-grow.sh" <<'EOF'
-#!/usr/bin/env bash
+          if [ ! -b "${DISK}" ]; then
+              echo "Disco no encontrado."
+              exit 1
+          fi
 
-set -u
+          if [ ! -b "${HOME_PART}" ]; then
+              echo "HOME no encontrado."
+              exit 1
+          fi
 
-LOG="/home/deck/steamos-firstboot-grow.log"
+          if ! command -v sgdisk >/dev/null 2>&1; then
+              echo "sgdisk no está disponible."
+              exit 1
+          fi
 
-exec >> "${LOG}" 2>&1
+          HOME_START="$(
+              sgdisk -i 8 "${DISK}" |
+              awk -F: '
+                  /First sector/ {
+                      gsub(/[[:space:]]/, "", $2)
+                      print $2
+                  }
+              '
+          )"
 
-echo
-echo "=============================================="
-echo "SteamOS first boot disk expansion"
-echo "=============================================="
-date
+          if [ -z "${HOME_START}" ]; then
+              echo "No se pudo obtener HOME_START."
+              exit 1
+          fi
 
-# ------------------------------------------------------------
-# ROOT DEVICE
-# ------------------------------------------------------------
+          LAST_SECTOR="$(sgdisk -E "${DISK}")"
 
-ROOT_SOURCE="$(
-    findmnt \
-        -n \
-        -o SOURCE \
-        /
-)
+          echo "HOME_START=${HOME_START}"
+          echo "LAST_SECTOR=${LAST_SECTOR}"
 
-echo "ROOT_SOURCE=${ROOT_SOURCE}"
+          CURRENT_END="$(
+              sgdisk -i 8 "${DISK}" |
+              awk -F: '
+                  /Last sector/ {
+                      gsub(/[[:space:]]/, "", $2)
+                      print $2
+                  }
+              '
+          )"
 
-# ------------------------------------------------------------
-# DETECT WHOLE DISK
-# ------------------------------------------------------------
+          echo "CURRENT_END=${CURRENT_END}"
 
-case "${ROOT_SOURCE}" in
+          if [ "${CURRENT_END}" -lt "${LAST_SECTOR}" ]; then
 
-    /dev/nvme*p*)
-        DISK="${ROOT_SOURCE%p*}"
-        ;;
+              echo "Extending HOME partition..."
 
-    /dev/mmcblk*p*)
-        DISK="${ROOT_SOURCE%p*}"
-        ;;
+              sgdisk \
+                  -d 8 \
+                  "${DISK}"
 
-    /dev/sd[a-z][0-9]*)
-        DISK="${ROOT_SOURCE%%[0-9]*}"
-        ;;
+              sgdisk \
+                  -n "8:${HOME_START}:${LAST_SECTOR}" \
+                  -t "8:8300" \
+                  "${DISK}"
 
-    *)
-        echo "No se pudo determinar el disco."
-        exit 1
-        ;;
+              sgdisk \
+                  -e \
+                  "${DISK}"
 
-esac
-
-echo "DISK=${DISK}"
-
-if [ ! -b "${DISK}" ]; then
-    echo "Disco no encontrado."
-    exit 1
-fi
+              partprobe "${DISK}" || true
 
-# ------------------------------------------------------------
-# INSTALAR HERRAMIENTAS SI ESTÁN DISPONIBLES
-# ------------------------------------------------------------
+              udevadm settle || true
 
-command -v sgdisk >/dev/null 2>&1 || {
-    echo "sgdisk no está disponible."
-    exit 1
-}
-
-# ------------------------------------------------------------
-# MOVER BACKUP GPT
-# ------------------------------------------------------------
-
-echo "Moviendo GPT..."
-
-sgdisk \
-    -e \
-    "${DISK}" || exit 1
+              sleep 5
 
-# ------------------------------------------------------------
-# ENCONTRAR HOME
-#
-# SteamOS usa la partición 8 como HOME.
-# ------------------------------------------------------------
-
-HOME_PART="${DISK}p8"
+          else
 
-if [ ! -b "${HOME_PART}" ]; then
-
-    case "${DISK}" in
-        /dev/sd*)
-            HOME_PART="${DISK}8"
-            ;;
-        /dev/vd*)
-            HOME_PART="${DISK}8"
-            ;;
-        *)
-            echo "No se encontró HOME."
-            exit 1
-            ;;
-    esac
-
-fi
+              echo "HOME ya ocupa todo el disco."
 
-echo "HOME_PART=${HOME_PART}"
+          fi
 
-# ------------------------------------------------------------
-# OBTENER INICIO
-# ------------------------------------------------------------
+          FS_TYPE="$(
+              blkid \
+                  -o value \
+                  -s TYPE \
+                  "${HOME_PART}" \
+                  2>/dev/null \
+                  || true
+          )"
 
-HOME_START="$(
-    sgdisk -i 8 "${DISK}" |
-    awk -F: '
-        /First sector/ {
-            gsub(/[[:space:]]/, "", $2)
-            print $2
-        }
-    '
-)
+          echo "FS_TYPE=${FS_TYPE}"
 
-if [ -z "${HOME_START}" ]; then
-    echo "No se pudo determinar HOME_START."
-    exit 1
-fi
+          if [ "${FS_TYPE}" = "ext4" ]; then
 
-echo "HOME_START=${HOME_START}"
+              e2fsck \
+                  -f \
+                  "${HOME_PART}" || true
 
-# ------------------------------------------------------------
-# ÚLTIMO SECTOR
-# ------------------------------------------------------------
+              resize2fs \
+                  "${HOME_PART}" || true
 
-LAST_SECTOR="$(
-    sgdisk -E "${DISK}"
-)
+          elif [ "${FS_TYPE}" = "btrfs" ]; then
 
-echo "LAST_SECTOR=${LAST_SECTOR}"
+              mkdir -p /home
 
-if [ -z "${LAST_SECTOR}" ]; then
-    echo "No se pudo determinar LAST_SECTOR."
-    exit 1
-fi
+              mountpoint -q /home || \
+                  mount "${HOME_PART}" /home || true
 
-# ------------------------------------------------------------
-# OBTENER TIPO DE FILESYSTEM
-# ------------------------------------------------------------
+              btrfs filesystem resize max /home || true
 
-FS_TYPE="$(
-    blkid \
-        -o value \
-        -s TYPE \
-        "${HOME_PART}" \
-        2>/dev/null \
-        || true
-)
+          else
 
-echo "FS_TYPE=${FS_TYPE}"
+              echo "Filesystem no soportado: ${FS_TYPE}"
 
-# ------------------------------------------------------------
-# COMPROBAR SI YA OCUPA TODO
-# ------------------------------------------------------------
+          fi
 
-CURRENT_END="$(
-    sgdisk -i 8 "${DISK}" |
-    awk -F: '
-        /Last sector/ {
-            gsub(/[[:space:]]/, "", $2)
-            print $2
-        }
-    '
-)"
+          touch /home/deck/.steamos-firstboot-grow-complete
 
-echo "CURRENT_END=${CURRENT_END}"
+          echo "Disk expansion completed."
+          date
+          '''
 
-if [ "${CURRENT_END}" -lt "${LAST_SECTOR}" ]; then
+          with open(output, "w", encoding="utf-8") as f:
+              f.write(script)
 
-    echo "Extendiendo partición 8..."
-
-    sgdisk \
-        -d 8 \
-        "${DISK}" || exit 1
-
-    sgdisk \
-        -n "8:${HOME_START}:${LAST_SECTOR}" \
-        -t "8:8300" \
-        "${DISK}" || exit 1
-
-    sgdisk \
-        -e \
-        "${DISK}" || exit 1
-
-    partprobe "${DISK}" || true
-
-    udevadm settle || true
-
-    sleep 3
-
-fi
-
-# ------------------------------------------------------------
-# CRECER FILESYSTEM
-# ------------------------------------------------------------
-
-if [ "${FS_TYPE}" = "ext4" ]; then
-
-    echo "Creciendo ext4..."
-
-    e2fsck \
-        -f \
-        "${HOME_PART}" || true
-
-    resize2fs \
-        "${HOME_PART}" || true
-
-elif [ "${FS_TYPE}" = "btrfs" ]; then
-
-    echo "Creciendo Btrfs..."
-
-    mountpoint -q /home || {
-        mount "${HOME_PART}" /home || true
-    }
-
-    btrfs filesystem resize max /home || true
-
-else
-
-    echo "Filesystem no soportado automáticamente: ${FS_TYPE}"
-
-fi
-
-# ------------------------------------------------------------
-# MARCAR COMO COMPLETADO
-# ------------------------------------------------------------
-
-touch /home/deck/.steamos-firstboot-grow-complete
-
-echo
-echo "Expansión completada."
-date
-
-exit 0
-EOF
+          PY
 
           chmod +x \
-            "${FIRST_BOOT_DIR}/steamos-firstboot-grow.sh"
+            "${WORKDIR}/firstboot/steamos-firstboot-grow.sh"
 
-      # ============================================================
-      # CREAR UNIDAD SYSTEMD
-      # ============================================================
-
-      - name: Create first boot systemd unit
+      - name: Generate first boot service
         shell: bash
         run: |
           set -euxo pipefail
 
-          FIRST_BOOT_DIR="${WORKDIR}/firstboot"
+          python3 - "${WORKDIR}/firstboot/steamos-firstboot-grow.service" <<'PY'
+          import sys
 
-          cat > "${FIRST_BOOT_DIR}/steamos-firstboot-grow.service" <<'EOF'
-[Unit]
-Description=SteamOS automatic first boot disk expansion
-After=local-fs.target
-Before=graphical.target
+          output = sys.argv[1]
 
-ConditionPathExists=!/home/deck/.steamos-firstboot-grow-complete
+          service = """[Unit]
+          Description=SteamOS automatic first boot disk expansion
+          After=local-fs.target
+          Before=graphical.target
+          ConditionPathExists=!/home/deck/.steamos-firstboot-grow-complete
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/steamos-firstboot-grow.sh
-RemainAfterExit=yes
-TimeoutStartSec=10min
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/steamos-firstboot-grow.sh
+          RemainAfterExit=yes
+          TimeoutStartSec=10min
 
-[Install]
-WantedBy=multi-user.target
-EOF
+          [Install]
+          WantedBy=multi-user.target
+          """
 
-      # ============================================================
-      # COPIAR SCRIPT A HOME
-      # ============================================================
+          with open(output, "w", encoding="utf-8") as f:
+              f.write(service)
 
-      - name: Install first boot files
+          PY
+
+      - name: Install first boot service into HOME
         shell: bash
         run: |
           set -euxo pipefail
 
-          LOOP="${LOOP_DEVICE}"
+          MOUNT="${WORKDIR}/mount/home"
 
-          # Montar HOME.
-          sudo mkdir -p "${WORKDIR}/mount/home"
+          sudo mkdir -p "${MOUNT}"
 
           sudo mount \
-            "${LOOP}p8" \
-            "${WORKDIR}/mount/home"
-
-          echo "HOME montado."
+            "${LOOP_DEVICE}p8" \
+            "${MOUNT}"
 
           sudo mkdir -p \
-            "${WORKDIR}/mount/home/.steamos-firstboot"
+            "${MOUNT}/.steamos-firstboot"
 
           sudo cp \
             "${WORKDIR}/firstboot/steamos-firstboot-grow.sh" \
-            "${WORKDIR}/mount/home/.steamos-firstboot/"
+            "${MOUNT}/.steamos-firstboot/steamos-firstboot-grow.sh"
 
           sudo chmod +x \
-            "${WORKDIR}/mount/home/.steamos-firstboot/steamos-firstboot-grow.sh"
+            "${MOUNT}/.steamos-firstboot/steamos-firstboot-grow.sh"
 
           sudo sync
 
           sudo umount \
-            "${WORKDIR}/mount/home"
+            "${MOUNT}"
 
-      # ============================================================
-      # PREPARAR ROOTFS PARA EL SERVICIO
-      #
-      # Intentamos localizar el rootfs-A y modificar solamente la
-      # capa persistente necesaria para ejecutar el servicio.
-      # ============================================================
-
-      - name: Inspect root filesystems
+      - name: Inspect SteamOS root partitions
         shell: bash
         run: |
           set -euxo pipefail
-
-          echo "Particiones root:"
-
-          sudo sgdisk -p "${FINAL_IMAGE}" |
-            grep -E '^[[:space:]]*[45][[:space:]]' || true
-
-          echo
-          echo "Filesystem types:"
 
           sudo blkid \
             "${LOOP_DEVICE}p4" \
@@ -817,19 +552,15 @@ EOF
             "${LOOP_DEVICE}p8" \
             || true
 
-      # ============================================================
-      # INTENTAR MONTAR ROOT-A
-      # ============================================================
-
-      - name: Install systemd first boot service
+      - name: Install automatic expansion service
         shell: bash
         run: |
           set -euxo pipefail
 
           ROOT_A="${LOOP_DEVICE}p4"
+          MOUNT="${WORKDIR}/mount/root-a"
 
-          sudo mkdir -p \
-            "${WORKDIR}/mount/root-a"
+          sudo mkdir -p "${MOUNT}"
 
           ROOT_TYPE="$(
             sudo blkid \
@@ -842,58 +573,46 @@ EOF
           echo "ROOT-A filesystem: ${ROOT_TYPE}"
 
           if [ "${ROOT_TYPE}" != "ext4" ] && [ "${ROOT_TYPE}" != "btrfs" ]; then
-            echo
-            echo "ROOT-A no es un filesystem modificable directamente."
-            echo
-            echo "Esto es esperado en algunas imágenes SteamOS."
-            echo "La imagen no será marcada como completamente automática."
+            echo "ERROR: ROOT-A no es modificable como filesystem."
+            echo "La imagen de este release utiliza un formato incompatible con esta técnica."
             exit 1
           fi
 
           sudo mount \
             "${ROOT_A}" \
-            "${WORKDIR}/mount/root-a"
+            "${MOUNT}"
 
-          # Verificar que realmente sea un rootfs.
-          if [ ! -d "${WORKDIR}/mount/root-a/etc" ]; then
+          if [ ! -d "${MOUNT}/etc" ]; then
             echo "ERROR: ROOT-A no contiene /etc."
-            sudo umount "${WORKDIR}/mount/root-a"
+            sudo umount "${MOUNT}"
             exit 1
           fi
 
           sudo mkdir -p \
-            "${WORKDIR}/mount/root-a/usr/local/sbin"
+            "${MOUNT}/usr/local/sbin"
 
           sudo mkdir -p \
-            "${WORKDIR}/mount/root-a/etc/systemd/system"
+            "${MOUNT}/etc/systemd/system/multi-user.target.wants"
 
           sudo cp \
             "${WORKDIR}/firstboot/steamos-firstboot-grow.sh" \
-            "${WORKDIR}/mount/root-a/usr/local/sbin/steamos-firstboot-grow.sh"
+            "${MOUNT}/usr/local/sbin/steamos-firstboot-grow.sh"
 
           sudo chmod +x \
-            "${WORKDIR}/mount/root-a/usr/local/sbin/steamos-firstboot-grow.sh"
+            "${MOUNT}/usr/local/sbin/steamos-firstboot-grow.sh"
 
           sudo cp \
             "${WORKDIR}/firstboot/steamos-firstboot-grow.service" \
-            "${WORKDIR}/mount/root-a/etc/systemd/system/steamos-firstboot-grow.service"
-
-          # Habilitar servicio.
-          sudo mkdir -p \
-            "${WORKDIR}/mount/root-a/etc/systemd/system/multi-user.target.wants"
+            "${MOUNT}/etc/systemd/system/steamos-firstboot-grow.service"
 
           sudo ln -sf \
             /etc/systemd/system/steamos-firstboot-grow.service \
-            "${WORKDIR}/mount/root-a/etc/systemd/system/multi-user.target.wants/steamos-firstboot-grow.service"
+            "${MOUNT}/etc/systemd/system/multi-user.target.wants/steamos-firstboot-grow.service"
 
           sudo sync
 
           sudo umount \
-            "${WORKDIR}/mount/root-a"
-
-      # ============================================================
-      # LIMPIEZA LOOP
-      # ============================================================
+            "${MOUNT}"
 
       - name: Detach image
         if: always()
@@ -901,50 +620,52 @@ EOF
         run: |
           set +e
 
+          sudo umount \
+            "${WORKDIR}/mount/home" \
+            2>/dev/null || true
+
+          sudo umount \
+            "${WORKDIR}/mount/root-a" \
+            2>/dev/null || true
+
           if [ -n "${LOOP_DEVICE:-}" ]; then
-            sudo umount \
-              "${WORKDIR}/mount/home" \
-              2>/dev/null || true
-
-            sudo umount \
-              "${WORKDIR}/mount/root-a" \
-              2>/dev/null || true
-
             sudo losetup \
               -d \
               "${LOOP_DEVICE}" \
               2>/dev/null || true
           fi
 
-      # ============================================================
-      # VERIFICACIÓN FINAL
-      # ============================================================
-
-      - name: Final image verification
+      - name: Verify final image
         shell: bash
         run: |
           set -euxo pipefail
 
+          IMG="${WORKDIR}/output/SteamOS-installed.img"
+
           echo "=============================================="
-          echo "FINAL IMAGE"
+          echo "FINAL STEAMOS IMAGE"
           echo "=============================================="
 
-          ls -lh "${FINAL_IMAGE}"
+          ls -lh "${IMG}"
 
           echo
-          echo "GPT:"
-          sudo sgdisk -v "${FINAL_IMAGE}"
+          echo "GPT verification:"
+
+          sudo sgdisk \
+            -v \
+            "${IMG}"
 
           echo
-          sudo sgdisk -p "${FINAL_IMAGE}"
+          sudo sgdisk \
+            -p \
+            "${IMG}"
 
           echo
-          echo "HOME:"
-          sudo sgdisk -i 8 "${FINAL_IMAGE}"
+          echo "HOME partition:"
 
-      # ============================================================
-      # SHA256
-      # ============================================================
+          sudo sgdisk \
+            -i 8 \
+            "${IMG}"
 
       - name: Generate SHA256
         shell: bash
@@ -958,10 +679,6 @@ EOF
             > SteamOS-installed.img.sha256
 
           cat SteamOS-installed.img.sha256
-
-      # ============================================================
-      # COMPRIMIR
-      # ============================================================
 
       - name: Compress RAW
         shell: bash
@@ -981,11 +698,7 @@ EOF
             SteamOS-installed.img \
             SteamOS-installed.img.zst
 
-      # ============================================================
-      # DIVIDIR
-      # ============================================================
-
-      - name: Split image
+      - name: Split compressed image
         shell: bash
         run: |
           set -euxo pipefail
@@ -1002,94 +715,91 @@ EOF
           ls -lh \
             SteamOS-installed.img.zst.part-*
 
-      # ============================================================
-      # SCRIPT WINDOWS
-      # ============================================================
-
-      - name: Create Windows JOIN script
+      - name: Create Windows reconstruction script
         shell: bash
         run: |
           set -euxo pipefail
 
           cd "${WORKDIR}/output"
 
-          cat > JOIN-WINDOWS.ps1 <<'EOF'
-$ErrorActionPreference = "Stop"
+          python3 - "JOIN-WINDOWS.ps1" <<'PY'
+          import sys
 
-$output = "SteamOS-installed.img.zst"
+          output = sys.argv[1]
 
-if (Test-Path $output) {
-    Remove-Item $output -Force
-}
+          script = r'''$ErrorActionPreference = "Stop"
 
-$parts = Get-ChildItem `
-    -File `
-    "SteamOS-installed.img.zst.part-*" |
-    Sort-Object Name
+          $output = "SteamOS-installed.img.zst"
 
-if ($parts.Count -eq 0) {
-    throw "No se encontraron partes."
-}
+          if (Test-Path $output) {
+              Remove-Item $output -Force
+          }
 
-$destination = [System.IO.File]::Open(
-    $output,
-    [System.IO.FileMode]::Create,
-    [System.IO.FileAccess]::Write
-)
+          $parts = Get-ChildItem `
+              -File `
+              "SteamOS-installed.img.zst.part-*" |
+              Sort-Object Name
 
-try {
+          if ($parts.Count -eq 0) {
+              throw "No se encontraron partes."
+          }
 
-    foreach ($part in $parts) {
+          $destination = [System.IO.File]::Open(
+              $output,
+              [System.IO.FileMode]::Create,
+              [System.IO.FileAccess]::Write
+          )
 
-        Write-Host "Agregando $($part.Name)..."
+          try {
+              foreach ($part in $parts) {
 
-        $source = [System.IO.File]::OpenRead(
-            $part.FullName
-        )
+                  Write-Host "Agregando $($part.Name)..."
 
-        try {
+                  $source = [System.IO.File]::OpenRead(
+                      $part.FullName
+                  )
 
-            $buffer = New-Object byte[] 1048576
+                  try {
+                      $buffer = New-Object byte[] 1048576
 
-            while (
-                ($read = $source.Read(
-                    $buffer,
-                    0,
-                    $buffer.Length
-                )) -gt 0
-            ) {
-                $destination.Write(
-                    $buffer,
-                    0,
-                    $read
-                )
-            }
+                      while (
+                          ($read = $source.Read(
+                              $buffer,
+                              0,
+                              $buffer.Length
+                          )) -gt 0
+                      ) {
+                          $destination.Write(
+                              $buffer,
+                              0,
+                              $read
+                          )
+                      }
+                  }
+                  finally {
+                      $source.Dispose()
+                  }
+              }
+          }
+          finally {
+              $destination.Dispose()
+          }
 
-        }
-        finally {
-            $source.Dispose()
-        }
-    }
+          Write-Host ""
+          Write-Host "Imagen reconstruida:"
+          Get-Item $output
 
-}
-finally {
-    $destination.Dispose()
-}
+          Write-Host ""
+          Write-Host "Descomprimir con:"
+          Write-Host "zstd -d SteamOS-installed.img.zst -o SteamOS-installed.img"
+          '''
 
-Write-Host ""
-Write-Host "Creado:"
-Get-Item $output
+          with open(output, "w", encoding="utf-8") as f:
+              f.write(script)
 
-Write-Host ""
-Write-Host "Descomprimir:"
-Write-Host "zstd -d SteamOS-installed.img.zst -o SteamOS-installed.img"
-EOF
+          PY
 
-      # ============================================================
-      # INFO
-      # ============================================================
-
-      - name: Create BUILD-INFO
+      - name: Create build info
         shell: bash
         run: |
           set -euxo pipefail
@@ -1097,46 +807,39 @@ EOF
           cd "${WORKDIR}/output"
 
           cat > BUILD-INFO.txt <<EOF
-SteamOS Installed RAW
-=====================
+          SteamOS Installed RAW
+          =====================
 
-Valve release:
-${STEAMOS_VERSION}
+          Valve release:
+          ${STEAMOS_VERSION}
 
-SteamOS release:
-${STEAMOS_RELEASE}
+          SteamOS release:
+          ${STEAMOS_RELEASE}
 
-Source:
-${STEAMOS_URL}
+          Official source:
+          ${STEAMOS_URL}
 
-Base image:
-${IMAGE_SIZE}
+          Base image size:
+          ${IMAGE_SIZE}
 
-Output:
-SteamOS-installed.img
+          Output:
+          SteamOS-installed.img
 
-Automatic first boot expansion:
-YES
+          Automatic first-boot expansion:
+          ENABLED
 
-First boot behavior:
+          First boot:
+          - Detect physical disk
+          - Move backup GPT to disk end
+          - Extend partition 8
+          - Grow filesystem
+          - Create completion marker
 
-1. Detecta el disco físico.
-2. Mueve la GPT secundaria al final.
-3. Detecta la partición 8.
-4. Extiende la partición 8.
-5. Extiende el filesystem.
-6. Crea .steamos-firstboot-grow-complete.
-7. No vuelve a ejecutarse.
-
-SHA256:
-$(cat SteamOS-installed.img.sha256)
-EOF
+          SHA256:
+          $(cat SteamOS-installed.img.sha256)
+          EOF
 
           cat BUILD-INFO.txt
-
-      # ============================================================
-      # ARTIFACT
-      # ============================================================
 
       - name: Upload SteamOS artifacts
         uses: actions/upload-artifact@v4
@@ -1150,23 +853,20 @@ EOF
             /home/runner/steamos-build/output/BUILD-INFO.txt
             /home/runner/steamos-build/output/JOIN-WINDOWS.ps1
 
-      # ============================================================
-      # RESUMEN
-      # ============================================================
-
-      - name: Summary
+      - name: Final summary
         shell: bash
         run: |
           set -euxo pipefail
 
           echo
           echo "=============================================="
-          echo "STEAMOS BUILD TERMINADO"
+          echo "STEAMOS BUILD COMPLETED"
           echo "=============================================="
-          echo
 
-          ls -lh "${WORKDIR}/output"
+          ls -lh \
+            "${WORKDIR}/output"
 
           echo
           echo "SHA256:"
-          cat "${WORKDIR}/output/SteamOS-installed.img.sha256"
+          cat \
+            "${WORKDIR}/output/SteamOS-installed.img.sha256"
