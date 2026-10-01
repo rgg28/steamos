@@ -151,22 +151,15 @@ jobs:
 
           sync
 
-      - name: Get HOME partition start
+            - name: Get HOME partition start
         shell: bash
         run: |
           set -euxo pipefail
 
           IMG="${WORKDIR}/output/SteamOS-installed.img"
 
-          HOME_START="$(
-            sudo sgdisk -i 8 "${IMG}" |
-            awk -F: '
-              /First sector/ {
-                gsub(/[[:space:]]/, "", $2)
-                print $2
-              }
-            '
-          )"
+          # Salvamos la info de la partición de forma segura limpiando espacios
+          HOME_START=$(sudo sgdisk -i 8 "${IMG}" | grep -i "First sector" | cut -d':' -f2 | awk '{print $1}')
 
           if [ -z "${HOME_START}" ]; then
             echo "ERROR: no se pudo obtener HOME_START."
@@ -175,6 +168,7 @@ jobs:
 
           echo "HOME_START=${HOME_START}"
           echo "HOME_START=${HOME_START}" >> "${GITHUB_ENV}"
+
 
       - name: Expand GPT
         shell: bash
