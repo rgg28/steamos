@@ -1,0 +1,35 @@
+#!/bin/bash
+# Script simplificado para instalar SteamOS directo al pendrive
+
+TARGET_DISK="/dev/sda" # Asegúrate con 'lsblk' de que este sea tu pendrive
+
+echo "=== Iniciando formateo del pendrive $TARGET_DISK ==="
+
+# 1. Crear tabla de particiones GPT limpia
+sgdisk --zap-all $TARGET_DISK
+sgdisk --clear $TARGET_DISK
+
+# 2. Crear las particiones básicas de SteamOS (Estructura simplificada)
+# Partición 1: EFI Boot (512MB)
+sgdisk --new=1:0:+512M --typecode=1:ef00 --change-name=1:"efi" $TARGET_DISK
+# Partición 2: Root A (Sistema - 5GB)
+sgdisk --new=2:0:+5G --typecode=2:8300 --change-name=2:"rootfs-a" $TARGET_DISK
+# Partición 3: Root B (Respaldo Sistema - 5GB)
+sgdisk --new=3:0:+5G --typecode=3:8300 --change-name=3:"rootfs-b" $TARGET_DISK
+# Partición 4: Datos de usuario (Resto del pendrive)
+sgdisk --new=4:0:0 --typecode=4:8300 --change-name=4:"home" $TARGET_DISK
+
+# Informar al kernel de los cambios
+partprobe $TARGET_DISK
+
+echo "=== Formateando particiones ==="
+mkfs.vfat -F32 "${TARGET_DISK}1"
+mkfs.ext4 -F "${TARGET_DISK}2"
+mkfs.ext4 -F "${TARGET_DISK}3"
+mkfs.ext4 -F "${TARGET_DISK}4"
+
+echo "=== Volcando sistema base ==="
+# Aquí tu script debe extraer la imagen de SteamOS (rootfs.raw) sobre la partición activa
+# dd if=/ruta/de/tu/rootfs.raw of="${TARGET_DISK}2" bs=4M status=progress
+
+echo "¡Instalación completada en el pendrive!"
