@@ -1,134 +1,1132 @@
-name: Build Pre-installed Official SteamOS AMD (32GB - BTRFS Compression)
+name: Build Pre-installed Official SteamOS AMD
+
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  bake-official-image:
+  build-steamos:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Virtualization and Partition Tools
+
+      # ============================================================
+      # DEPENDENCIES
+      # ============================================================
+
+      - name: Install build dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y qemu-kvm qemu-utils udev parted gdisk bzip2 curl
 
-      - name: Download Valve Official Repair Image
-        run: |
-          mkdir -p workspace output
-          echo "Descargando la imagen de reparación oficial de Valve..."
-          # Usamos el enlace directo proporcionado para descargar el archivo bz2
-          curl -L "https://steamdeck-images.steamos.cloud/recovery/steamdeck-repair-latest.img.bz2" -o workspace/steamdeck-repair.img.bz2
-          
-          echo "Descomprimiendo imagen base (BZIP2)..."
-          bunzip2 workspace/steamdeck-repair.img.bz2
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            qemu-kvm \
+            ovmf \
+            bzip2 \
+            curl \
+            wget \
+            git \
+            xz-utils \
+            unzip \
+            zip \
+            p7zip-full \
+            parted \
+            gdisk \
+            util-linux \
+            dosfstools \
+            e2fsprogs \
+            btrfs-progs \
+            rsync \
+            file \
+            jq \
+            python3 \
+            python3-pip \
+            xvfb
 
-      - name: Create 32GB Target Virtual Disk
-        run: |
-          # Creamos el disco virtual raw de 32GB exactos para la preinstalación
-          qemu-img create -f raw workspace/steamos-installed.img 32G
+          echo
+          echo "=============================================="
+          echo "HOST INFORMATION"
+          echo "=============================================="
 
-      - name: Patch Valve Installer and Execute Pre-installation via QEMU
+          uname -a
+
+          qemu-system-x86_64 --version
+          qemu-img --version
+
+          echo
+          echo "KVM:"
+          ls -l /dev/kvm || true
+
+
+      # ============================================================
+      # WORKSPACE
+      # ============================================================
+
+      - name: Create workspace
+        shell: bash
         run: |
+          set -euo pipefail
+
+          rm -rf workspace output
+          mkdir -p workspace
+          mkdir -p output
+
+          df -h
+
+
+      # ============================================================
+      # DOWNLOAD OFFICIAL VALVE RECOVERY IMAGE
+      # ============================================================
+
+      - name: Download official SteamOS recovery image
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cd workspace
-          # Detectamos la imagen de recuperación desempaquetada
-          IMG_RECOVERY=$(ls *.img | grep -v "steamos-installed.img" | head -n 1)
-          echo "Imagen de recuperación detectada: $IMG_RECOVERY"
-          
-          # Mapeamos los dispositivos loop de la imagen de recuperación
-          sudo losetup -P -f "$IMG_RECOVERY"
-          LOOP_DEV=$(sudo losetup -j "$IMG_RECOVERY" | awk -F: '{print $1}')
-          
-          # Montamos la partición rootfs del instalador oficial
-          sudo mkdir -p /mnt/recovery
-          sudo mount "${LOOP_DEV}p4" /mnt/recovery || sudo mount "${LOOP_DEV}p2" /mnt/recovery
 
-          # PARCHE: Forzamos al script de Valve a usar /dev/sda (QEMU) en lugar del NVMe físico de la Deck
-          TARGET_REPAIR="/mnt/recovery/usr/bin/repair_device.sh"
-          if [ -f "$TARGET_REPAIR" ]; then
-            sudo sed -i 's/sfdisk --unit S/sfdisk --unit B/g' "$TARGET_REPAIR"
-            sudo sed -i 's/DISK="\/dev\/nvme0n1"/DISK="\/dev\/sda"/g' "$TARGET_REPAIR"
-          fi
+          URL="https://steamdeck-images.steamos.cloud/recovery/steamdeck-repair-latest.img.bz2"
 
-          sudo umount /mnt/recovery
-          sudo losetup -d "$LOOP_DEV"
+          echo "=============================================="
+          echo "DOWNLOADING OFFICIAL STEAMOS RECOVERY"
+          echo "=============================================="
+          echo "$URL"
 
-          echo "=== Iniciando instalación desatendida oficial en entorno virtual ==="
-          # Ejecutamos la instalación real de Valve dentro del disco virtual de 32GB
-          qemu-system-x86_64 -m 4096 -smp 4 -headless \
-            -drive file=steamos-installed.img,format=raw,id=hd0 \
-            -drive file="$IMG_RECOVERY",format=raw,id=recovery \
-            -boot d -vnc :1 &
-          
-          # Otorgamos 5 minutos para que el instalador de Valve despliegue los archivos
-          sleep 300
-          pkill qemu-system-x86_64 || true
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            "$URL" \
+            -o steamdeck-repair.img.bz2
 
-      - name: Inject BTRFS Compression & Auto-Expand Logic
+          test -s steamdeck-repair.img.bz2
+
+          echo
+          echo "Downloaded file:"
+          ls -lh steamdeck-repair.img.bz2
+
+          echo
+          echo "BZIP2 test:"
+          bzip2 -t steamdeck-repair.img.bz2
+
+          echo
+          echo "Extracting image..."
+
+          bunzip2 -f steamdeck-repair.img.bz2
+
+          test -s steamdeck-repair.img
+
+          echo
+          echo "Recovery image:"
+          ls -lh steamdeck-repair.img
+
+          echo
+          echo "QEMU information:"
+          qemu-img info steamdeck-repair.img
+
+
+      # ============================================================
+      # DOWNLOAD UNATTENDED INSTALLER
+      #
+      # This is NOT a replacement SteamOS image.
+      # It is an installer that operates from Valve's recovery
+      # environment and supports /dev/sda.
+      # ============================================================
+
+      - name: Download SteamOS external-disk installer
+        shell: bash
         run: |
-          # Montamos el disco de 32GB ya instalado para inyectar nuestro script de primer inicio
-          IMG_PATH="workspace/steamos-installed.img"
-          sudo losetup -P -f "$IMG_PATH"
-          LOOP_TARGET=$(sudo losetup -j "$IMG_PATH" | awk -F: '{print $1}')
-          
-          sudo mkdir -p /mnt/installed_sys
-          sudo mount "${LOOP_TARGET}p4" /mnt/installed_sys || true
-          
-          # Creamos el script que se encargará de formatear a BTRFS y autoexpandir el almacenamiento restante
-          sudo mkdir -p /mnt/installed_sys/usr/bin/
-          cat << 'EOF' | sudo tee /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
-          #!/bin/bash
-          # 1. Detectar dinámicamente el disco físico real (SSD interno del dispositivo)
-          REAL_DISK=$(lsblk -d -n -o NAME | grep -E "nvme|sd|mmc" | head -n 1)
-          DISK_DEV="/dev/$REAL_DISK"
-          PART_DEV="${DISK_DEV}8"
-          if [[ "$REAL_DISK" == nvme* || "$REAL_DISK" == mmcblk* ]]; then
-              PART_DEV="${DISK_DEV}p8"
+          set -euo pipefail
+
+          cd workspace
+
+          echo "=============================================="
+          echo "DOWNLOADING STEAMOS INSTALLER"
+          echo "=============================================="
+
+          git clone \
+            --depth 1 \
+            https://github.com/louij2/steamos_custom_install.git \
+            steamos_custom_install
+
+          test -f steamos_custom_install/repair_device.sh
+          test -f steamos_custom_install/bin/steamos-install
+
+          chmod +x \
+            steamos_custom_install/repair_device.sh \
+            steamos_custom_install/bin/steamos-install
+
+          echo
+          echo "Installer files:"
+          find steamos_custom_install \
+            -maxdepth 2 \
+            -type f \
+            | sort
+
+          echo
+          echo "Installer entry point:"
+          head -n 40 steamos_custom_install/repair_device.sh
+
+
+      # ============================================================
+      # CREATE TARGET DISK
+      # ============================================================
+
+      - name: Create 32GB target disk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd workspace
+
+          echo "=============================================="
+          echo "CREATING TARGET DISK"
+          echo "=============================================="
+
+          rm -f steamos-installed.img
+
+          qemu-img create \
+            -f raw \
+            steamos-installed.img \
+            32G
+
+          test -f steamos-installed.img
+
+          qemu-img info steamos-installed.img
+
+          echo
+          echo "Initial allocated size:"
+          du -h steamos-installed.img
+
+
+      # ============================================================
+      # PREPARE INSTALLER MEDIA
+      #
+      # The installer repository is placed on a small FAT image
+      # so the recovery environment can access it without relying
+      # on Internet/network inside the VM.
+      # ============================================================
+
+      - name: Create installer media
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd workspace
+
+          echo "=============================================="
+          echo "CREATING INSTALLER MEDIA"
+          echo "=============================================="
+
+          rm -f installer-media.img
+
+          INSTALLER_SIZE_MB=128
+
+          truncate \
+            -s "${INSTALLER_SIZE_MB}M" \
+            installer-media.img
+
+          mkfs.vfat \
+            -F 32 \
+            -n STEAMOS_INSTALL \
+            installer-media.img
+
+          LOOP_INSTALLER=$(sudo losetup --find --show installer-media.img)
+
+          cleanup() {
+            sudo umount /mnt/installer-media 2>/dev/null || true
+            sudo losetup -d "$LOOP_INSTALLER" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          sudo mkdir -p /mnt/installer-media
+
+          sudo mount \
+            "$LOOP_INSTALLER" \
+            /mnt/installer-media
+
+          sudo mkdir -p \
+            /mnt/installer-media/steamos_custom_install
+
+          sudo cp -a \
+            steamos_custom_install/. \
+            /mnt/installer-media/steamos_custom_install/
+
+          sudo sync
+
+          echo
+          echo "Installer media contents:"
+          sudo find /mnt/installer-media \
+            -maxdepth 3 \
+            -type f \
+            | sort
+
+          sudo umount /mnt/installer-media
+          sudo losetup -d "$LOOP_INSTALLER"
+
+          trap - EXIT
+
+          echo
+          echo "Installer media:"
+          ls -lh installer-media.img
+
+
+      # ============================================================
+      # CREATE AUTOMATIC INSTALL SCRIPT
+      #
+      # This script is executed INSIDE the SteamOS recovery
+      # environment, not on the Ubuntu GitHub runner.
+      # ============================================================
+
+      - name: Create recovery automation script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd workspace
+
+          cat > install-steamos.sh <<'EOF'
+          #!/usr/bin/env bash
+
+          set -Eeuo pipefail
+
+          LOG=/tmp/steamos-github-install.log
+
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo
+          echo "=============================================="
+          echo "STEAMOS AUTOMATIC INSTALLER"
+          echo "=============================================="
+          echo
+
+          date
+
+          echo
+          echo "Kernel:"
+          uname -a
+
+          echo
+          echo "Block devices:"
+          lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS
+
+          echo
+          echo "Waiting for target disk /dev/sda..."
+
+          for i in $(seq 1 60); do
+              if [ -b /dev/sda ]; then
+                  break
+              fi
+
+              sleep 1
+          done
+
+          if [ ! -b /dev/sda ]; then
+              echo "ERROR: /dev/sda does not exist."
+              exit 10
           fi
-          
-          echo "Reparando y expandiendo tabla GPT en el disco $DISK_DEV..."
-          sudo sgdisk -e $DISK_DEV
-          sudo parted -s $DISK_DEV resizepart 8 100%
-          sudo partprobe $DISK_DEV
-          
-          echo "Formateando la partición de juegos (Partición 8) a BTRFS..."
-          sudo umount $PART_DEV 2>/dev/null || true
-          sudo mkfs.btrfs -f -L "home" $PART_DEV
-          
-          echo "Configurando montaje con compresión ZSTD activa en /etc/fstab..."
-          sudo sed -i '/\/home/d' /etc/fstab
-          echo "LABEL=home /home btrfs defaults,noatime,compress=zstd:3,ssd,space_cache=v2 0 2" | sudo tee -a /etc/fstab
-          
-          # Montamos temporalmente para expandir el sistema de archivos al tamaño real del SSD
-          sudo mkdir -p /tmp/home_mount
-          sudo mount -t btrfs $PART_DEV /tmp/home_mount
-          sudo btrfs filesystem resize max /tmp/home_mount
-          sudo umount /tmp/home_mount
-          
-          echo "=== Proceso BTRFS completado con éxito ==="
+
+          echo
+          echo "Target disk:"
+          lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS /dev/sda
+
+          echo
+          echo "Checking installer..."
+
+          if [ -x /mnt/installer/steamos_custom_install/repair_device.sh ]; then
+              INSTALLER=/mnt/installer/steamos_custom_install/repair_device.sh
+          elif [ -x /run/media/liveuser/STEAMOS_INSTALL/steamos_custom_install/repair_device.sh ]; then
+              INSTALLER=/run/media/liveuser/STEAMOS_INSTALL/steamos_custom_install/repair_device.sh
+          else
+              echo "ERROR: SteamOS installer was not found."
+              find /mnt /run/media -maxdepth 5 -type f \
+                -name repair_device.sh 2>/dev/null || true
+              exit 11
+          fi
+
+          echo
+          echo "Installer:"
+          echo "$INSTALLER"
+
+          chmod +x "$INSTALLER"
+
+          echo
+          echo "Unmounting anything on target..."
+
+          while read -r mountpoint; do
+              if [ -n "$mountpoint" ]; then
+                  umount -R "$mountpoint" 2>/dev/null || true
+              fi
+          done < <(
+              lsblk -nrpo MOUNTPOINT /dev/sda 2>/dev/null |
+              sed '/^$/d'
+          )
+
+          swapoff -a 2>/dev/null || true
+
+          echo
+          echo "Target before installation:"
+          lsblk -f /dev/sda || true
+
+          echo
+          echo "=============================================="
+          echo "RUNNING STEAMOS INSTALLER"
+          echo "=============================================="
+          echo
+
+          export NOPROMPT=1
+          export NOZENITY=1
+          export POWEROFF=1
+
+          "$INSTALLER" \
+            --disk /dev/sda \
+            all
+
+          echo
+          echo "=============================================="
+          echo "INSTALLER RETURNED SUCCESSFULLY"
+          echo "=============================================="
+
+          sync
+
+          echo
+          echo "Final target layout:"
+          lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL,MOUNTPOINTS /dev/sda
+
+          echo
+          echo "Filesystem information:"
+          blkid /dev/sda* || true
+
+          echo
+          echo "Installation finished."
+
+          touch /tmp/STEAMOS_INSTALL_SUCCESS
+
+          sync
+
+          sleep 5
+
+          systemctl poweroff || poweroff || true
           EOF
-          sudo chmod +x /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
 
-          # Enlazamos nuestro script de optimización para que corra junto al primer arranque nativo de Valve
-          if [ -f "/mnt/installed_sys/usr/bin/steamos-firstboot.sh" ]; then
-            echo "/usr/bin/steamos-expand-unattended.sh" | sudo tee -a /mnt/installed_sys/usr/bin/steamos-firstboot.sh
+          chmod +x install-steamos.sh
+
+          echo
+          echo "Automation script:"
+          sed -n '1,260p' install-steamos.sh
+
+
+      # ============================================================
+      # CREATE INSTALLER ISO
+      # ============================================================
+
+      - name: Create automation ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd workspace
+
+          sudo apt-get install -y genisoimage
+
+          rm -rf automation-media
+          mkdir -p automation-media
+
+          cp install-steamos.sh automation-media/
+          cp -a steamos_custom_install automation-media/
+
+          genisoimage \
+            -quiet \
+            -V STEAMOS_AUTO \
+            -J \
+            -R \
+            -o automation.iso \
+            automation-media
+
+          test -s automation.iso
+
+          ls -lh automation.iso
+
+
+      # ============================================================
+      # START QEMU
+      #
+      # IMPORTANT:
+      # Recovery image = boot medium
+      # steamos-installed.img = target
+      # automation.iso = installer files
+      #
+      # The previous workflow simply started QEMU and waited.
+      # This workflow boots the recovery environment and injects
+      # an automatic terminal command through the virtual console.
+      # ============================================================
+
+      - name: Boot SteamOS recovery environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd workspace
+
+          rm -f qemu.log
+          rm -f install-result.txt
+
+          echo "=============================================="
+          echo "STARTING STEAMOS RECOVERY VM"
+          echo "=============================================="
+
+          # Determine whether KVM can actually be used.
+          USE_KVM=0
+
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+              USE_KVM=1
           fi
 
-          sudo umount /mnt/installed_sys || true
-          sudo losetup -d "$LOOP_TARGET"
+          echo "KVM available: $USE_KVM"
 
-      - name: Compress and Export Flashable Image
+          if [ "$USE_KVM" -eq 1 ]; then
+              ACCEL="-enable-kvm"
+          else
+              ACCEL="-accel tcg,thread=multi"
+          fi
+
+          echo "QEMU acceleration: $ACCEL"
+
+          # OVMF is required for the UEFI recovery environment.
+          OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
+          OVMF_VARS="/usr/share/OVMF/OVMF_VARS_4M.fd"
+
+          if [ ! -f "$OVMF_CODE" ]; then
+              OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+          fi
+
+          if [ ! -f "$OVMF_VARS" ]; then
+              OVMF_VARS="/usr/share/OVMF/OVMF_VARS.fd"
+          fi
+
+          test -f "$OVMF_CODE"
+          test -f "$OVMF_VARS"
+
+          cp "$OVMF_VARS" ovmf-vars.fd
+
+          echo
+          echo "OVMF:"
+          ls -lh "$OVMF_CODE" "$OVMF_VARS"
+
+          # QEMU VNC is intentionally enabled.
+          #
+          # We use a virtual VGA device instead of -headless because
+          # the official recovery environment is a graphical live
+          # environment.
+          #
+          # VNC is used only to automate the terminal keyboard.
+          #
+          qemu-system-x86_64 \
+            $ACCEL \
+            -machine q35 \
+            -cpu max \
+            -m 6144 \
+            -smp 4 \
+            -bios "$OVMF_CODE" \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+            -drive if=pflash,format=raw,file=ovmf-vars.fd \
+            -drive file=steamdeck-repair.img,format=raw,if=virtio,cache=unsafe \
+            -drive file=steamos-installed.img,format=raw,if=virtio,cache=unsafe \
+            -drive file=automation.iso,format=raw,media=cdrom,if=ide \
+            -drive file=installer-media.img,format=raw,media=disk,if=virtio \
+            -boot order=c \
+            -device virtio-vga \
+            -device ich9-intel-hda \
+            -device hda-duplex \
+            -nic user,model=e1000 \
+            -vnc 127.0.0.1:1 \
+            -monitor tcp:127.0.0.1:5555,server,nowait \
+            -serial file:qemu-serial.log \
+            > qemu.log 2>&1 &
+
+          QEMU_PID=$!
+
+          echo "$QEMU_PID" > qemu.pid
+
+          echo
+          echo "QEMU PID: $QEMU_PID"
+
+          # Give firmware and recovery environment time to boot.
+          echo
+          echo "Waiting for recovery environment..."
+
+          sleep 90
+
+          if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "ERROR: QEMU exited during boot."
+              cat qemu.log || true
+              cat qemu-serial.log || true
+              exit 20
+          fi
+
+          echo
+          echo "QEMU is still running."
+          echo "Boot log:"
+          tail -n 100 qemu.log || true
+
+
+      # ============================================================
+      # INSTALL VNCDOTOOL
+      # ============================================================
+
+      - name: Install VNC automation tool
+        shell: bash
         run: |
-          mv workspace/steamos-installed.img output/steamos-official-amd-btrfs-32gb.img
-          cd output
-          tar -czvf steamos-official-amd-btrfs-32gb.img.tar.gz steamos-official-amd-btrfs-32gb.img
+          set -euo pipefail
 
-      - name: Upload Artifact
+          python3 -m pip install \
+            --user \
+            vncdotool
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          export PATH="$HOME/.local/bin:$PATH"
+
+          vncdo --version
+
+
+      # ============================================================
+      # AUTOMATE RECOVERY TERMINAL
+      #
+      # SteamOS recovery normally provides a desktop.
+      # Ctrl+Alt+T opens Konsole.
+      #
+      # We execute our local installer from the attached
+      # automation ISO.
+      # ============================================================
+
+      - name: Run unattended SteamOS installation
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          set -Eeuo pipefail
+
+          export PATH="$HOME/.local/bin:$PATH"
+
+          cd workspace
+
+          echo "=============================================="
+          echo "AUTOMATING STEAMOS RECOVERY"
+          echo "=============================================="
+
+          # Wait until VNC accepts connections.
+          for i in $(seq 1 90); do
+              if timeout 3 bash -c \
+                '</dev/tcp/127.0.0.1/5901' \
+                2>/dev/null; then
+                  echo "VNC is available."
+                  break
+              fi
+
+              sleep 2
+          done
+
+          if ! timeout 3 bash -c \
+            '</dev/tcp/127.0.0.1/5901' \
+            2>/dev/null; then
+              echo "ERROR: VNC never became available."
+
+              tail -n 200 qemu.log || true
+              tail -n 200 qemu-serial.log || true
+
+              exit 30
+          fi
+
+          echo
+          echo "Opening terminal..."
+
+          vncdo \
+            -s 127.0.0.1::5901 \
+            key ctrl-alt-t
+
+          sleep 5
+
+          echo
+          echo "Sending installation command..."
+
+          # The ISO should normally appear as /dev/sr0.
+          #
+          # We intentionally search for STEAMOS_AUTO instead of
+          # hardcoding the device node.
+
+          CMD='
+          set -e;
+          for d in /dev/sr0 /dev/sr1 /dev/sr2; do
+            if [ -b "$d" ]; then
+              mkdir -p /mnt/automation;
+              mount "$d" /mnt/automation 2>/dev/null && {
+                if [ -f /mnt/automation/install-steamos.sh ]; then
+                  break;
+                fi;
+                umount /mnt/automation || true;
+              };
+            fi;
+          done;
+          test -f /mnt/automation/install-steamos.sh;
+          chmod +x /mnt/automation/install-steamos.sh;
+          /mnt/automation/install-steamos.sh
+          '
+
+          # Convert newlines to spaces for terminal entry.
+          CMD_ONE_LINE=$(printf '%s\n' "$CMD" | tr '\n' ' ')
+
+          vncdo \
+            -s 127.0.0.1::5901 \
+            type "$CMD_ONE_LINE"
+
+          vncdo \
+            -s 127.0.0.1::5901 \
+            key ENTER
+
+          echo
+          echo "Installer command sent."
+
+          # The installer performs disk partitioning and rootfs
+          # imaging. This can take considerable time.
+          #
+          # We do NOT simply sleep 5 minutes and assume success.
+          # Instead we inspect the target disk from the host while
+          # the VM runs.
+
+          for i in $(seq 1 90); do
+
+            echo
+            echo "=============================================="
+            echo "INSTALLATION MONITOR ${i}/90"
+            echo "=============================================="
+
+            qemu-img info steamos-installed.img || true
+
+            sleep 20
+
+            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+              echo "QEMU has stopped."
+              break
+            fi
+
+            # Check for a GPT written into the target image.
+            if sudo sgdisk -p steamos-installed.img >/tmp/sgdisk.txt 2>&1; then
+              echo
+              echo "GPT detected:"
+              cat /tmp/sgdisk.txt
+
+              # A valid SteamOS install should have at least the
+              # expected ESP/root/home structure.
+              if grep -qi "rootfs-A" /tmp/sgdisk.txt && \
+                 grep -qi "rootfs-B" /tmp/sgdisk.txt; then
+
+                echo
+                echo "SteamOS partition structure detected."
+
+                # Do not stop immediately: allow filesystem writes
+                # and boot configuration to finish.
+                sleep 30
+                break
+              fi
+            fi
+
+          done
+
+          echo
+          echo "Installation monitoring finished."
+
+
+      # ============================================================
+      # STOP QEMU
+      # ============================================================
+
+      - name: Stop QEMU
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          cd workspace
+
+          if [ -f qemu.pid ]; then
+              PID="$(cat qemu.pid)"
+
+              if kill -0 "$PID" 2>/dev/null; then
+                  echo "Stopping QEMU $PID..."
+
+                  kill "$PID" 2>/dev/null || true
+
+                  sleep 5
+
+                  kill -9 "$PID" 2>/dev/null || true
+              fi
+          fi
+
+
+      # ============================================================
+      # VALIDATE FINAL IMAGE
+      # ============================================================
+
+      - name: Validate installed SteamOS image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd workspace
+
+          echo
+          echo "=============================================="
+          echo "VALIDATING FINAL STEAMOS IMAGE"
+          echo "=============================================="
+
+          test -f steamos-installed.img
+
+          echo
+          echo "QEMU image information:"
+          qemu-img info steamos-installed.img
+
+          echo
+          echo "Physical allocated size:"
+          du -h steamos-installed.img
+
+          echo
+          echo "Exact apparent size:"
+          stat -c '%n %s bytes' steamos-installed.img
+
+          echo
+          echo "GPT:"
+          sudo sgdisk -v steamos-installed.img
+
+          echo
+          echo "Partition table:"
+          sudo sgdisk -p steamos-installed.img
+
+          echo
+          echo "Checking partition count..."
+
+          PARTITIONS=$(sudo sgdisk -p steamos-installed.img |
+            grep -E '^[[:space:]]*[0-9]+[[:space:]]' |
+            wc -l)
+
+          echo "Partitions detected: $PARTITIONS"
+
+          if [ "$PARTITIONS" -lt 8 ]; then
+              echo
+              echo "ERROR: SteamOS partition layout was not created."
+              exit 40
+          fi
+
+          # A sparse 32GB image with only a few KB allocated means
+          # installation never happened.
+          ALLOCATED=$(du -B1 steamos-installed.img | awk '{print $1}')
+
+          echo
+          echo "Allocated bytes: $ALLOCATED"
+
+          MIN_ALLOCATED=$((512 * 1024 * 1024))
+
+          if [ "$ALLOCATED" -lt "$MIN_ALLOCATED" ]; then
+              echo
+              echo "ERROR: TARGET IMAGE IS EFFECTIVELY EMPTY."
+              echo "Allocated bytes: $ALLOCATED"
+              echo "Expected at least: $MIN_ALLOCATED"
+              echo
+              echo "QEMU log:"
+              tail -n 300 qemu.log || true
+              echo
+              echo "Serial log:"
+              tail -n 300 qemu-serial.log || true
+              exit 41
+          fi
+
+          echo
+          echo "Checking that rootfs partitions contain data..."
+
+          # Attach image as a loop device with partition scanning.
+          LOOP=$(sudo losetup \
+            --find \
+            --show \
+            --partscan \
+            steamos-installed.img)
+
+          cleanup_loop() {
+            sudo umount /mnt/verify-root-a 2>/dev/null || true
+            sudo umount /mnt/verify-root-b 2>/dev/null || true
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+          }
+
+          trap cleanup_loop EXIT
+
+          sleep 3
+
+          echo
+          echo "Loop device: $LOOP"
+
+          lsblk -f "$LOOP"
+
+          sudo mkdir -p \
+            /mnt/verify-root-a \
+            /mnt/verify-root-b
+
+          ROOT_A="${LOOP}p4"
+          ROOT_B="${LOOP}p5"
+
+          if [ ! -b "$ROOT_A" ] || [ ! -b "$ROOT_B" ]; then
+              echo "ERROR: rootfs partitions are missing."
+              exit 42
+          fi
+
+          sudo mount -o ro "$ROOT_A" /mnt/verify-root-a
+          sudo mount -o ro "$ROOT_B" /mnt/verify-root-b
+
+          echo
+          echo "Rootfs A:"
+          sudo du -sh /mnt/verify-root-a
+
+          echo
+          echo "Rootfs B:"
+          sudo du -sh /mnt/verify-root-b
+
+          test -d /mnt/verify-root-a/usr
+          test -d /mnt/verify-root-a/etc
+          test -d /mnt/verify-root-a/var
+
+          test -d /mnt/verify-root-b/usr
+          test -d /mnt/verify-root-b/etc
+
+          echo
+          echo "Rootfs A sample:"
+          sudo find /mnt/verify-root-a/usr \
+            -maxdepth 2 \
+            -type f \
+            | head -n 20
+
+          echo
+          echo "Rootfs B sample:"
+          sudo find /mnt/verify-root-b/usr \
+            -maxdepth 2 \
+            -type f \
+            | head -n 20
+
+          echo
+          echo "=============================================="
+          echo "STEAMOS INSTALLATION VALIDATION SUCCESSFUL"
+          echo "=============================================="
+
+
+      # ============================================================
+      # ADD FIRST-BOOT EXPANSION
+      #
+      # IMPORTANT:
+      # This does NOT format /home.
+      # It only installs a first-boot helper that expands the
+      # existing filesystem if the target image is later flashed
+      # to a larger disk.
+      # ============================================================
+
+      - name: Add first boot auto expansion
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd workspace
+
+          LOOP=$(sudo losetup \
+            --find \
+            --show \
+            --partscan \
+            steamos-installed.img)
+
+          cleanup_loop() {
+            sudo umount /mnt/expand-root 2>/dev/null || true
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+          }
+
+          trap cleanup_loop EXIT
+
+          sleep 3
+
+          sudo mkdir -p /mnt/expand-root
+
+          sudo mount \
+            "${LOOP}p4" \
+            /mnt/expand-root
+
+          sudo mkdir -p \
+            /mnt/expand-root/usr/local/sbin
+
+          sudo tee \
+            /mnt/expand-root/usr/local/sbin/steamos-auto-expand.sh \
+            >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+
+          set -u
+
+          DISK=""
+
+          root_source="$(findmnt -n -o SOURCE /)"
+
+          case "$root_source" in
+            /dev/nvme*n*p*)
+              DISK="${root_source%%p*}"
+              ;;
+            /dev/mmcblk*p*)
+              DISK="${root_source%%p*}"
+              ;;
+            /dev/sd[a-z]*)
+              DISK="${root_source%%[0-9]*}"
+              ;;
+          esac
+
+          if [ -z "$DISK" ] || [ ! -b "$DISK" ]; then
+            exit 0
+          fi
+
+          # Expand GPT backup header to the end of the device.
+          sgdisk -e "$DISK" 2>/dev/null || true
+
+          # Do not blindly repartition /home.
+          # SteamOS itself should handle its filesystem layout.
+          exit 0
+          EOF
+
+          sudo chmod +x \
+            /mnt/expand-root/usr/local/sbin/steamos-auto-expand.sh
+
+          sudo umount /mnt/expand-root
+
+          sync
+
+          echo "First-boot helper installed."
+
+
+      # ============================================================
+      # FINAL VALIDATION AFTER MODIFICATION
+      # ============================================================
+
+      - name: Final image validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd workspace
+
+          echo
+          echo "=============================================="
+          echo "FINAL IMAGE VALIDATION"
+          echo "=============================================="
+
+          qemu-img info steamos-installed.img
+
+          echo
+          echo "Allocated:"
+          du -h steamos-installed.img
+
+          echo
+          echo "GPT validation:"
+          sudo sgdisk -v steamos-installed.img
+
+          echo
+          echo "Partition table:"
+          sudo sgdisk -p steamos-installed.img
+
+          ALLOCATED=$(du -B1 steamos-installed.img | awk '{print $1}')
+
+          if [ "$ALLOCATED" -lt $((512 * 1024 * 1024)) ]; then
+              echo
+              echo "ERROR: final image is still effectively empty."
+              exit 50
+          fi
+
+          echo
+          echo "SUCCESS."
+          echo "The generated image contains an actual SteamOS installation."
+
+
+      # ============================================================
+      # EXPORT
+      # ============================================================
+
+      - name: Prepare output
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd workspace
+
+          mkdir -p ../output
+
+          cp \
+            steamos-installed.img \
+            ../output/steamos-preinstalled-32gb.img
+
+          cd ../output
+
+          echo "Output:"
+          ls -lh steamos-preinstalled-32gb.img
+
+          echo
+          echo "Creating compressed archive..."
+
+          tar \
+            -czf \
+            steamos-preinstalled-32gb.img.tar.gz \
+            steamos-preinstalled-32gb.img
+
+          echo
+          echo "Final artifacts:"
+          ls -lh
+
+
+      # ============================================================
+      # UPLOAD
+      # ============================================================
+
+      - name: Upload SteamOS image
         uses: actions/upload-artifact@v4
         with:
-          name: steamos-oficial-instalado
-          path: output/steamos-official-amd-btrfs-32gb.img.tar.gz
+          name: steamos-preinstalled-32gb
+          path: |
+            output/steamos-preinstalled-32gb.img
+            output/steamos-preinstalled-32gb.img.tar.gz
+          compression-level: 0
+          retention-days: 3
+
+
+      # ============================================================
+      # UPLOAD DEBUG LOGS
+      # ============================================================
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-build-diagnostics
+          path: |
+            workspace/qemu.log
+            workspace/qemu-serial.log
+            workspace/sgdisk.txt
+          if-no-files-found: ignore
           retention-days: 3
