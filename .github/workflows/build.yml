@@ -14,15 +14,17 @@ jobs:
       - name: Install Virtualization Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-kvm qemu-utils udev parted gdisk aria2 bzip2
+          sudo apt-get install -y qemu-kvm qemu-utils udev parted gdisk bzip2 curl
 
       - name: Download Valve Official Recovery Image
         run: |
           mkdir -p workspace output
-          echo "Descargando última imagen oficial de Valve..."
-          aria2c -x 16 -s 16 "https://steamos.cloud" -d workspace
+          echo "Descargando imagen oficial desde los servidores estables de Valve..."
+          # URL corregida apuntando al repositorio de imágenes de Valve de SteamOS 3.x
+          curl -L "https://steamos.cloud" -o workspace/steamdeck-recovery.img.bz2
+          
           echo "Descomprimiendo imagen base..."
-          bunzip2 workspace/steamdeck-recovery-4.img.bz2
+          bunzip2 workspace/steamdeck-recovery.img.bz2
 
       - name: Create 32GB Target Virtual Disk
         run: |
@@ -31,8 +33,10 @@ jobs:
       - name: Patch Valve Installer and Execute Pre-installation via QEMU
         run: |
           cd workspace
-          sudo losetup -P -f steamdeck-recovery-4.img
-          LOOP_DEV=$(sudo losetup -j steamdeck-recovery-4.img | awk -F: '{print $1}')
+          IMG_RECOVERY=$(ls *.img | grep -v "steamos-installed.img" | head -n 1)
+          
+          sudo losetup -P -f "$IMG_RECOVERY"
+          LOOP_DEV=$(sudo losetup -j "$IMG_RECOVERY" | awk -F: '{print $1}')
           
           sudo mkdir -p /mnt/recovery
           sudo mount "${LOOP_DEV}p4" /mnt/recovery || sudo mount "${LOOP_DEV}p2" /mnt/recovery
@@ -49,7 +53,7 @@ jobs:
           echo "=== Iniciando instalación desatendida oficial ==="
           qemu-system-x86_64 -m 4096 -smp 4 -headless \
             -drive file=steamos-installed.img,format=raw,id=hd0 \
-            -drive file=steamdeck-recovery-4.img,format=raw,id=recovery \
+            -drive file="$IMG_RECOVERY",format=raw,id=recovery \
             -boot d -vnc :1 &
           
           sleep 300
@@ -64,11 +68,9 @@ jobs:
           sudo mkdir -p /mnt/installed_sys
           sudo mount "${LOOP_TARGET}p4" /mnt/installed_sys || true
           
-          # Creamos el script que se ejecutará en el primer inicio del hardware real
           sudo mkdir -p /mnt/installed_sys/usr/bin/
           cat << 'EOF' | sudo tee /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
           #!/bin/bash
-          # 1. Detectar el disco real
           REAL_DISK=$(lsblk -d -n -o NAME | grep -E "nvme|sd|mmc" | head -n 1)
           DISK_DEV="/dev/$REAL_DISK"
           PART_DEV="${DISK_DEV}8"
@@ -82,16 +84,13 @@ jobs:
           sudo partprobe $DISK_DEV
           
           echo "Formateando partición de juegos a BTRFS..."
-          # Forzamos el formateo a BTRFS eliminando rastros anteriores de EXT4
           sudo umount $PART_DEV 2>/dev/null || true
           sudo mkfs.btrfs -f -L "home" $PART_DEV
           
           echo "Configurando montaje con compresión ZSTD en /etc/fstab..."
-          # Reemplazamos la línea de montaje de /home en fstab para usar BTRFS con compresión zstd:3 (óptimo rendimiento/espacio)
           sudo sed -i '/\/home/d' /etc/fstab
           echo "LABEL=home /home btrfs defaults,noatime,compress=zstd:3,ssd,space_cache=v2 0 2" | sudo tee -a /etc/fstab
           
-          # Montar y expandir al máximo físico del disco
           sudo mkdir -p /tmp/home_mount
           sudo mount -t btrfs $PART_DEV /tmp/home_mount
           sudo btrfs filesystem resize max /tmp/home_mount
@@ -101,7 +100,6 @@ jobs:
           EOF
           sudo chmod +x /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
 
-          # Enlazar al script de primer arranque nativo de SteamOS
           if [ -f "/mnt/installed_sys/usr/bin/steamos-firstboot.sh" ]; then
             echo "/usr/bin/steamos-expand-unattended.sh" | sudo tee -a /mnt/installed_sys/usr/bin/steamos-firstboot.sh
           fi
