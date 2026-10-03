@@ -1,0 +1,159 @@
+name: Build Pure SteamOS Image (No Desktop)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Build Dependencies
+      run: |
+        pacman-key --init
+        pacman-key --populate archlinux
+        pacman -Syu --noconfirm parted dosfstools e2fsprogs arch-install-scripts xz git curl
+
+    - name: Create 4GB Base Virtual Disk Image
+      run: |
+        dd if=/dev/zero of=steamos-pure.img bs=1M count=4096
+        parted steamos-pure.img --script mklabel gpt
+        parted steamos-pure.img --script mkpart ESP fat32 1MiB 512MiB
+        parted steamos-pure.img --script set 1 esp on
+        parted steamos-pure.img --script mkpart root ext4 512MiB 100%
+
+    - name: Mount and Bootstrap System
+      run: |
+        LOOP_DEV=$(losetup -fP --show steamos-pure.img)
+        echo "LOOP_DEV=${LOOP_DEV}" >> $GITHUB_ENV
+        
+        mkfs.vfat -F32 "${LOOP_DEV}p1"
+        mkfs.ext4 -F "${LOOP_DEV}p2"
+        
+        mkdir -p /mnt/target
+        mount "${LOOP_DEV}p2" /mnt/target
+        mkdir -p /mnt/target/boot
+        mount "${LOOP_DEV}p1" /mnt/target/boot
+
+        echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+
+        # Drivers gráficos universales (Mesa y Nvidia) y sistema base
+        pacstrap -K /mnt/target base linux linux-firmware networkmanager sudo nano \
+          mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel \
+          nvidia-utils lib32-nvidia-utils xorg-server xorg-xinit pipewire pipewire-pulse \
+          pipewire-alsa wireplumber bluez bluez-utils
+
+    - name: Inject Valve Repositories and Protection (Chroot)
+      run: |
+        arch-chroot /mnt/target bash -c "
+          echo 'UUID=\$(blkid -s UUID -o value ${LOOP_DEV}p2) / ext4 defaults 0 1' > /etc/fstab
+          echo 'UUID=\$(blkid -s UUID -o value ${LOOP_DEV}p1) /boot vfat defaults 0 2' >> /etc/fstab
+
+          # 1. AGREGAR LOS REPOSITORIOS ORIGINALES DE VALVE Y HOLO
+          echo -e '\n[jupiter-main]\nServer = https://steamos.cloud' >> /etc/pacman.conf
+          echo -e '\n[holo]\nSigLevel = TrustAll\nServer = https://github.io' >> /etc/pacman.conf
+          
+          # 2. ESCUDO DE PROTECCIÓN: Evitar que las actualizaciones de Valve pisen los drivers de PC genéricas
+          sed -i '/\[options\]/a IgnorePkg = jupiter-hw-support linux-neptune-vgalib' /etc/pacman.conf
+
+          pacman -Sy --noconfirm
+          
+          # 3. Instalación de la UI original de Valve, Heroic y optimizadores de SteamOS
+          pacman -S --noconfirm steam gamescope gamescope-session-steam steamdeck-dsp \
+            powerbuttond gamemode lib32-gamemode mangohud lib32-mangohud heroic-games-launcher-bin parted
+
+          systemctl enable NetworkManager
+          systemctl enable bluetooth
+          systemctl enable powerbuttond
+
+          # Crear usuario obligatorio 'deck'
+          useradd -m -g users -G wheel,video,audio,input,power -s /bin/bash deck
+          passwd -d deck
+          echo 'deck ALL=(ALL:ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+          # ---- SCRIPT DE AUTO-EXPANSIÓN DE PARTICIÓN AL 100% ----
+          cat << 'EOF' > /usr/local/bin/auto-expand.sh
+          #!/bin/bash
+          ROOT_DEV=\$(findmnt -n -o SOURCE /)
+          DISK_DEV=\$(lsblk -no pkname \$ROOT_DEV)
+          PART_NUM=\$(echo \$ROOT_DEV | grep -o '[0-3]\$')
+          if [ -z \"\$PART_NUM\" ]; then
+              PART_NUM=\$(echo \$ROOT_DEV | grep -o 'p[0-9]\$' | tr -d 'p')
+          fi
+          parted /dev/\$DISK_DEV resizepart \$PART_NUM 100%
+          partprobe /dev/\$DISK_DEV
+          resize2fs \$ROOT_DEV
+          systemctl disable auto-expand.service
+          EOF
+          chmod +x /usr/local/bin/auto-expand.sh
+
+          cat << 'EOF' > /etc/systemd/system/auto-expand.service
+          [Unit]
+          Description=Auto expand root partition on first boot
+          After=local-fs.target
+          Before=getty@tty1.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/auto-expand.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl enable auto-expand.service
+
+          # Omitir gestores de escritorio e ir directo a la TTY del modo de juego
+          mkdir -p /etc/systemd/system/getty@tty1.service.d
+          echo -e '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin deck --noclear %I \$TERM' > /etc/systemd/system/getty@tty1.service.d/override.conf
+
+          bootctl install
+          echo -e 'default arch\ntimeout 1' > /boot/loader/loader.conf
+          echo -e 'title SteamOS Pure Console\nlinux /vmlinuz-linux\ninitrd /initramfs-linux.img\noptions root=PARTUUID=\$(blkid -s PARTUUID -o value ${LOOP_DEV}p2) rw' > /boot/loader/entries/arch.conf
+        "
+
+    - name: Inject Decky Loader and Heroic Shortcut
+      run: |
+        mkdir -p /mnt/target/home/deck/
+        echo "exec gamescope-session" > /mnt/target/home/deck/.xinitrc
+        echo -e 'if [ -z "$DISPLAY" ] && [ "$XDG_VTNR" -eq 1 ]; then\n  exec startx\nfi' >> /mnt/target/home/deck/.bash_profile
+        
+        # Inyectar Decky Loader
+        curl -L https://github.com --output /mnt/target/root/decky-install.sh
+        chmod +x /mnt/target/root/decky-install.sh
+        echo "/root/decky-install.sh" >> /mnt/target/usr/local/bin/auto-expand.sh
+
+        # Crear acceso directo de Heroic en la biblioteca "No de Steam"
+        mkdir -p /mnt/target/home/deck/.steam/steam/userdata/0/config/
+        cat << 'EOF' > /mnt/target/usr/local/bin/add-heroic-shortcut.sh
+        #!/bin/bash
+        if [ ! -f /home/deck/.steam/steam/userdata/0/config/shortcuts.vdf ]; then
+            echo -e "shortcuts\n{\n\t\"0\"\n\t{\n\t\t\"AppName\"\t\"Heroic Games Launcher\"\n\t\t\"Exe\"\t\"/usr/bin/heroic-games-launcher\"\n\t\t\"StartDir\"\t\"/usr/bin/\"\n\t\t\"LaunchOptions\"\t\"--no-sandbox\"\n\t}\n}" > /home/deck/.steam/steam/userdata/0/config/shortcuts.vdf
+            chown -R 1000:1000 /home/deck/.steam/
+        fi
+        EOF
+        chmod +x /mnt/target/usr/local/bin/add-heroic-shortcut.sh
+        echo "/usr/local/bin/add-heroic-shortcut.sh" >> /mnt/target/usr/local/bin/auto-expand.sh
+
+        chown -R 1000:1000 /mnt/target/home/deck/
+
+    - name: Finalize, Compress and Export Image
+      if: always()
+      run: |
+        umount -R /mnt/target || true
+        losetup -d ${{ env.LOOP_DEV }} || true
+        xz -z -6 steamos-pure.img
+
+    - name: Upload SteamOS Pure IMG
+      uses: actions/upload-artifact@v4
+      with:
+        name: SteamOS-Pure-IMG
+        path: steamos-pure.img.xz
