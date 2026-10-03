@@ -1,4 +1,4 @@
-name: Build Pre-installed Official SteamOS AMD (32GB - BTRFS Compresion)
+name: Build Pre-installed Official SteamOS AMD (32GB - BTRFS Compression)
 on:
   push:
     branches: [ main ]
@@ -11,36 +11,42 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Virtualization Tools
+      - name: Install Virtualization and Partition Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-kvm qemu-utils udev parted gdisk bzip2 curl
 
-      - name: Download Valve Official Recovery Image
+      - name: Download Valve Official Repair Image
         run: |
           mkdir -p workspace output
-          echo "Descargando imagen oficial desde los servidores estables de Valve..."
-          # URL corregida apuntando al repositorio de imágenes de Valve de SteamOS 3.x
-          curl -L "https://steamos.cloud" -o workspace/steamdeck-recovery.img.bz2
+          echo "Descargando la imagen de reparación oficial de Valve..."
+          # Usamos el enlace directo proporcionado para descargar el archivo bz2
+          curl -L "https://steamdeck-images.steamos.cloud/recovery/steamdeck-repair-latest.img.bz2" -o workspace/steamdeck-repair.img.bz2
           
-          echo "Descomprimiendo imagen base..."
-          bunzip2 workspace/steamdeck-recovery.img.bz2
+          echo "Descomprimiendo imagen base (BZIP2)..."
+          bunzip2 workspace/steamdeck-repair.img.bz2
 
       - name: Create 32GB Target Virtual Disk
         run: |
+          # Creamos el disco virtual raw de 32GB exactos para la preinstalación
           qemu-img create -f raw workspace/steamos-installed.img 32G
 
       - name: Patch Valve Installer and Execute Pre-installation via QEMU
         run: |
           cd workspace
+          # Detectamos la imagen de recuperación desempaquetada
           IMG_RECOVERY=$(ls *.img | grep -v "steamos-installed.img" | head -n 1)
+          echo "Imagen de recuperación detectada: $IMG_RECOVERY"
           
+          # Mapeamos los dispositivos loop de la imagen de recuperación
           sudo losetup -P -f "$IMG_RECOVERY"
           LOOP_DEV=$(sudo losetup -j "$IMG_RECOVERY" | awk -F: '{print $1}')
           
+          # Montamos la partición rootfs del instalador oficial
           sudo mkdir -p /mnt/recovery
           sudo mount "${LOOP_DEV}p4" /mnt/recovery || sudo mount "${LOOP_DEV}p2" /mnt/recovery
 
+          # PARCHE: Forzamos al script de Valve a usar /dev/sda (QEMU) en lugar del NVMe físico de la Deck
           TARGET_REPAIR="/mnt/recovery/usr/bin/repair_device.sh"
           if [ -f "$TARGET_REPAIR" ]; then
             sudo sed -i 's/sfdisk --unit S/sfdisk --unit B/g' "$TARGET_REPAIR"
@@ -50,17 +56,20 @@ jobs:
           sudo umount /mnt/recovery
           sudo losetup -d "$LOOP_DEV"
 
-          echo "=== Iniciando instalación desatendida oficial ==="
+          echo "=== Iniciando instalación desatendida oficial en entorno virtual ==="
+          # Ejecutamos la instalación real de Valve dentro del disco virtual de 32GB
           qemu-system-x86_64 -m 4096 -smp 4 -headless \
             -drive file=steamos-installed.img,format=raw,id=hd0 \
             -drive file="$IMG_RECOVERY",format=raw,id=recovery \
             -boot d -vnc :1 &
           
+          # Otorgamos 5 minutos para que el instalador de Valve despliegue los archivos
           sleep 300
           pkill qemu-system-x86_64 || true
 
       - name: Inject BTRFS Compression & Auto-Expand Logic
         run: |
+          # Montamos el disco de 32GB ya instalado para inyectar nuestro script de primer inicio
           IMG_PATH="workspace/steamos-installed.img"
           sudo losetup -P -f "$IMG_PATH"
           LOOP_TARGET=$(sudo losetup -j "$IMG_PATH" | awk -F: '{print $1}')
@@ -68,9 +77,11 @@ jobs:
           sudo mkdir -p /mnt/installed_sys
           sudo mount "${LOOP_TARGET}p4" /mnt/installed_sys || true
           
+          # Creamos el script que se encargará de formatear a BTRFS y autoexpandir el almacenamiento restante
           sudo mkdir -p /mnt/installed_sys/usr/bin/
           cat << 'EOF' | sudo tee /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
           #!/bin/bash
+          # 1. Detectar dinámicamente el disco físico real (SSD interno del dispositivo)
           REAL_DISK=$(lsblk -d -n -o NAME | grep -E "nvme|sd|mmc" | head -n 1)
           DISK_DEV="/dev/$REAL_DISK"
           PART_DEV="${DISK_DEV}8"
@@ -78,28 +89,30 @@ jobs:
               PART_DEV="${DISK_DEV}p8"
           fi
           
-          echo "Reparando y expandiendo tabla GPT en $DISK_DEV..."
+          echo "Reparando y expandiendo tabla GPT en el disco $DISK_DEV..."
           sudo sgdisk -e $DISK_DEV
           sudo parted -s $DISK_DEV resizepart 8 100%
           sudo partprobe $DISK_DEV
           
-          echo "Formateando partición de juegos a BTRFS..."
+          echo "Formateando la partición de juegos (Partición 8) a BTRFS..."
           sudo umount $PART_DEV 2>/dev/null || true
           sudo mkfs.btrfs -f -L "home" $PART_DEV
           
-          echo "Configurando montaje con compresión ZSTD en /etc/fstab..."
+          echo "Configurando montaje con compresión ZSTD activa en /etc/fstab..."
           sudo sed -i '/\/home/d' /etc/fstab
           echo "LABEL=home /home btrfs defaults,noatime,compress=zstd:3,ssd,space_cache=v2 0 2" | sudo tee -a /etc/fstab
           
+          # Montamos temporalmente para expandir el sistema de archivos al tamaño real del SSD
           sudo mkdir -p /tmp/home_mount
           sudo mount -t btrfs $PART_DEV /tmp/home_mount
           sudo btrfs filesystem resize max /tmp/home_mount
           sudo umount /tmp/home_mount
           
-          echo "=== BTRFS con compresión ZSTD configurado exitosamente ==="
+          echo "=== Proceso BTRFS completado con éxito ==="
           EOF
           sudo chmod +x /mnt/installed_sys/usr/bin/steamos-expand-unattended.sh
 
+          # Enlazamos nuestro script de optimización para que corra junto al primer arranque nativo de Valve
           if [ -f "/mnt/installed_sys/usr/bin/steamos-firstboot.sh" ]; then
             echo "/usr/bin/steamos-expand-unattended.sh" | sudo tee -a /mnt/installed_sys/usr/bin/steamos-firstboot.sh
           fi
@@ -107,7 +120,7 @@ jobs:
           sudo umount /mnt/installed_sys || true
           sudo losetup -d "$LOOP_TARGET"
 
-      - name: Compress and Export Pre-installed Image
+      - name: Compress and Export Flashable Image
         run: |
           mv workspace/steamos-installed.img output/steamos-official-amd-btrfs-32gb.img
           cd output
@@ -116,6 +129,6 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: steamos-btrfs-listo
+          name: steamos-oficial-instalado
           path: output/steamos-official-amd-btrfs-32gb.img.tar.gz
           retention-days: 3
