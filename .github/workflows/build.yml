@@ -1,0 +1,78 @@
+name: Build Auto-Expanding SteamOS IMG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full wget qemu-utils gdisk parted
+
+      - name: Download SteamOS Recovery Image
+        run: |
+          echo "📥 Descargando imagen del instalador oficial..."
+          wget -q -O steamos-recovery.img.bz2 https://steampowered.com
+
+      - name: Extract Recovery Image
+        run: |
+          echo "📦 Extrayendo el instalador..."
+          7z x steamos-recovery.img.bz2 -y
+          IMG_NAME=$(ls *.img | head -n 1)
+          echo "INSTALLER_IMG=$IMG_NAME" >> $GITHUB_ENV
+
+      - name: Create Target Disk and Run Silent Installation
+        run: |
+          echo "💽 Creando un disco virtual en blanco de 64GB..."
+          qemu-img create -f raw steamos_final_instalado.img 64G
+
+          echo "⚙️ Montando dispositivos loop..."
+          sudo losetup -fP "${{ env.INSTALLER_IMG }}"
+          LOOP_INSTALLER=$(losetup -a | grep "${{ env.INSTALLER_IMG }}" | awk -F: '{print $1}')
+          
+          sudo losetup -fP steamos_final_instalado.img
+          LOOP_TARGET=$(losetup -a | grep "steamos_final_instalado.img" | awk -F: '{print $1}')
+
+          echo "🛠️ Adaptando script oficial de Valve para instalación desatendida..."
+          mkdir -p ./installer_root
+          sudo mount "${LOOP_INSTALLER}p2" ./installer_root || sudo mount "${LOOP_INSTALLER}p3" ./installer_root
+          cp -r ./installer_root/home/deck/tools ./tools_copiadas
+          sudo umount ./installer_root
+
+          sed -i "s|DISK=/dev/nvme0n1|DISK=${LOOP_TARGET}|g" ./tools_copiadas/repair_device.sh
+          sed -i "s|DISK_SUFFIX=p|DISK_SUFFIX=p|g" ./tools_copiadas/repair_device.sh
+          sed -i 's|zenity --question|true|g' ./tools_copiadas/repair_device.sh
+          sed -i 's|zenity --info|echo|g' ./tools_copiadas/repair_device.sh
+
+          echo "🚀 Ejecutando instalación de SteamOS..."
+          sudo chmod +x ./tools_copiadas/repair_device.sh
+          sudo ./tools_copiadas/repair_device.sh all || echo "Ignorando advertencias de reinicio"
+
+          echo "🔧 Asegurando autoreparación de GPT para expansión de disco..."
+          # Al crear la imagen en un entorno de 64GB, la tabla GPT secundaria queda fija en ese tamaño.
+          # Al flashearla en un disco de 512GB o 1TB, las herramientas de abajo le dicen a la GPT
+          # que se mueva al final del nuevo almacenamiento físico verdadero para permitir la expansión.
+          sudo sgdisk -e steamos_final_instalado.img
+
+          echo "🧹 Desmontando dispositivos..."
+          sudo losetup -d $LOOP_INSTALLER
+          sudo losetup -d $LOOP_TARGET
+
+      - name: Compress Installed Image (Split for GitHub Limits)
+        run: |
+          echo "🗜️ Comprimiendo el sistema operativo ya instalado..."
+          7z a -v2g steamos_final_listo.7z steamos_final_instalado.img
+
+      - name: Upload Installed OS as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-auto-expanding-img
+          path: steamos_final_listo.7z.*
+          retention-days: 3
