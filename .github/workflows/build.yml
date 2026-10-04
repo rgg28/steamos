@@ -19,7 +19,7 @@ jobs:
       - name: Download SteamOS Recovery Image
         run: |
           echo "📥 Descargando imagen del instalador oficial..."
-          wget -q -O steamos-recovery.img.bz2 https://steampowered.com
+          wget -q -O steamos-recovery.img.bz2 https://steamdeck-images.steamos.cloud/recovery/steamdeck-repair-latest.img.bz2
 
       - name: Extract Recovery Image
         run: |
